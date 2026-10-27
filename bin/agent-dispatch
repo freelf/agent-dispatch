@@ -1,7 +1,9 @@
 #!/bin/sh
 # 调度层入口：把一张任务卡派给执行器，跑完自动过门禁，把结果交回主脑。
 # 步骤：解析卡头 → 查映射表得到组和推理强度 → 渲染最终 prompt
-#       （角色声明 + 执行规则 + 卡正文 [+ 上一轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读，见 agent-run）
+#       （角色声明 + 执行规则 + 写代码规范 + 卡正文 [+ 上一轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读，见 agent-run）
+#   写代码规范 = magpie Library 里勾了 pi 的 skill（$pi_home/skills）的正文；执行器本身不加载 skill。
+#   角色声明 + 执行规则 + 写代码规范合计不超过 12KB（对应 261004 执行器侧的注入上限），卡和修复说明不算。
 #       → agent-run → agent-gate → 从 magpie usage 查实际接请求的模型 → 写 dispatch.json。
 # worktree 由主脑事先用 agent-worktree 建好（并行、排队、基线由主脑决定），调度层不建也不合并。
 # 用法：agent-dispatch <worktree> <card.md> [fix-notes.md]
@@ -19,6 +21,8 @@ worktree=$1
 card=$2
 notes=${3:-}
 max_fix_rounds=3
+rules_limit=12288
+pi_home=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
 root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
 bin=$root/bin
 
@@ -33,6 +37,10 @@ field() {
         inside && $0 == "---" { exit }
         inside && index($0, k ":") == 1 { v = substr($0, length(k) + 2); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit }
     ' "$card"
+}
+# 去掉开头两行 --- 之间的卡头 / frontmatter
+body() {
+    awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm' "$1"
 }
 id=$(field id)
 type=$(field type)
@@ -112,12 +120,26 @@ trap 'rm -f "$prompt"' EXIT
 5. 你在 sandbox 里：只能写当前 worktree，只能访问本机网络。遇到 Operation not permitted 或网络失败，不要尝试绕过，在最后的回复里说明。
 6. 提交前自查：系统提示里的项目规则（AGENTS.md）有 agent-gate 代码块就跑它的 build/test 命令（合并前门禁会独立再跑一遍）；没有就按项目规则里的构建、测试说明尽量自查，在回复里写明跑了哪些命令、结果如何、哪些在 sandbox 里跑不了。
 7. 最后的回复用几行写清：做了什么、提交了哪些、自查结果、没做完或有疑问的地方。
-8. 系统提示里列出了可用的 skill：开工前先用 read 读完和写代码相关的 skill，按它做。skill 里要你「问用户」的地方没人可问，改为按最保守的理解做，在最后的回复里写明假设。
-
-# 任务卡
-
+8. 下面有「写代码规范」就照做。规范里要你「问用户」的地方没人可问，改为按最保守的理解做，在最后的回复里写明假设。
 EOF
-    awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm' "$card"
+    for s in "$pi_home/skills"/*; do
+        f=$s
+        [ -d "$s" ] && f=$s/SKILL.md
+        [ -f "$f" ] || continue
+        printf '\n# 写代码规范：%s\n\n' "$(basename "$s")"
+        body "$f"
+    done
+} > "$prompt"
+rules_size=$(wc -c < "$prompt" | tr -d ' ')
+if [ "$rules_size" -gt "$rules_limit" ]; then
+    echo "DISPATCH ERROR: 角色声明 + 执行规则 + 写代码规范共 ${rules_size} 字节，超过上限 ${rules_limit}：在 magpie Library 里给 pi 少勾几个 skill" >&2
+    exit 2
+fi
+{
+    echo
+    echo "# 任务卡"
+    echo
+    body "$card"
     if [ -n "$notes" ]; then
         echo
         echo "# 修复（第 ${fix} 轮）"
@@ -132,7 +154,7 @@ EOF
         echo
         cat "$notes"
     fi
-} > "$prompt"
+} >> "$prompt"
 
 rc=0
 run_dir=$("$bin/agent-run" "$worktree" "$prompt" "$group" "$effort" "$label") || rc=$?

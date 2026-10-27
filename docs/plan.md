@@ -47,7 +47,7 @@ Claude 不跑无头、不进执行器路由组（订阅条款风险）。
 | 组件 | 位置 | 说明 |
 |---|---|---|
 | `agent-worktree <id> [base]` | bin/ | 从基线拉 `card/<id>`，worktree 在 `<仓库同级>/<仓库名>-cards/<id>`；把被忽略的 `AGENTS.md`、`CLAUDE.md`、`.codex/skills`、`.serena/*.yml` 软链接进去（只链主仓库有、worktree 没有、且被忽略的） |
-| `agent-dispatch <wt> <card> [fix-notes]` | bin/ | 调度层入口。解析卡头 → 查 `routing.tsv` → 渲染 prompt（角色声明 + 执行规则 + 卡正文 [+ 上轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读）→ `agent-run` → `agent-gate` → 从 `magpie usage` 按会话号查实际模型 → 写 `dispatch.json`。退出码 0 绿 / 1 红 / 2 错误 / 3 需主脑处理（修满 3 轮） |
+| `agent-dispatch <wt> <card> [fix-notes]` | bin/ | 调度层入口。解析卡头 → 查 `routing.tsv` → 渲染 prompt（角色声明 + 执行规则 + 写代码规范（≤12KB）+ 卡正文 [+ 上轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读）→ `agent-run` → `agent-gate` → 从 `magpie usage` 按会话号查实际模型 → 写 `dispatch.json`。退出码 0 绿 / 1 红 / 2 错误 / 3 需主脑处理（修满 3 轮） |
 | `agent-run [--read-only] <wt> <prompt> <group> <effort> <label>` | bin/ | 在 sandbox 里跑 Pi，见第 5 节。检查 Pi 最后回复的 `stopReason`，`error/aborted` 判失败（Pi 出错也可能以 0 退出） |
 | `agent-gate <wt> <base>` | bin/ | 门禁，见第 6 节 |
 | `agent-advise <wt> <question>` | bin/ | Advisor：`advisor` 组、只读 sandbox、空白上下文；材料 = 卡 + 各轮门禁结论 + 改动概况 + 主脑的问题，不给执行器对话历史 |
@@ -86,7 +86,7 @@ Claude 不跑无头、不进执行器路由组（订阅条款风险）。
 
 - Pi 0.73.0（`npm i -g @mariozechner/pi-coding-agent`），`magpie pi` 已写好 `~/.pi/agent/models.json`。
 - 每次运行给 Pi 一份临时配置目录（只含 models.json + 关遥测的 settings），`PI_OFFLINE=1`；`--no-session --no-skills --no-extensions`，工具 `read,bash,edit,write`（Advisor 为 `read,grep,find,ls,bash`）。
-- skill（2026-10-27）：装给 Pi 的 skill（`~/.pi/agent/skills`，在 magpie Library 里给 skill 勾上 pi）用 `--skill` 逐个传给执行器；`--no-skills` 保留，不扫 worktree 和 `~/.agents/skills`。Pi 只把描述放进系统提示，执行规则第 8 条要求开工前读完相关 skill；`agent-run` 从事件里查每个 SKILL.md 是否被读，打印 `RUN: skills <名字>(已读|未读)`，记在运行记录的 `skills.status`。
+- skill（2026-10-27 定稿）：执行器一律不加载 skill（`--no-skills`）。写代码规范由 `agent-dispatch` 渲染进 prompt：取 magpie Library 里勾了 pi 的 skill（`~/.pi/agent/skills`）的正文，拼在执行规则后面；角色声明 + 执行规则 + 写代码规范合计超过 12KB 就拒绝派发。
 - MCP：执行器暂时用不了，有两处障碍。① 装的 `@mariozechner/pi-coding-agent` 0.73 没有 MCP，这个包名已停在 0.73.1，Pi 改到 `@earendil-works/pi-coding-agent`（1.4.0），据 pi-mcp-adapter 的 README，Pi 0.99 起自带 MCP；② sandbox 禁外网，context7、exa、deepwiki 都要联网，需要在 sandbox 外起一个本机 MCP 中转，执行器经 localhost 访问。现在由主脑用 MCP 查好、写进卡里。
 - 项目规则（2026-10-27 改）：由 Pi 自己读。Pi 从 worktree 往上，每级目录只取第一个 AGENTS.md / CLAUDE.md 放进系统提示（0.73 `dist/core/resource-loader.js`），所以同一目录不会重复注入；临时配置目录里没有全局 AGENTS.md，worktree 的上级目录目前也没有。项目统一用根目录 AGENTS.md，必须入库或被 .gitignore 忽略（被忽略的由 `agent-worktree` 软链进去），否则 worktree 里没有，执行器读不到。`agent-run` 按同样的规则查一遍，打印 `RUN: rules <文件>`。这条依赖 Pi 的行为，升级 Pi 后要重新验证。
 - 首轮输入约 4.5k token，不含项目 AGENTS.md（Codex 为 14k–21k）。
@@ -131,15 +131,15 @@ AI 审查、规则式审查（OCR）、改动量、格式检查不在门禁里�
 9. 公司代码可以交给外部模型；ChatGPT 订阅可以给 Pi 用（2026-10-27 确认）。
 10. 公司仓库暂不声明门禁：执行器改完直接交主脑验收；主脑在验收结论里写明哪些编译测试没验证。
 11. 主脑规则分两层（对应 261004 的"主脑专属常驻 + Skill 按需加载"）：常驻的角色声明写在全局 `~/.claude/CLAUDE.md`（两行：只调研规划拆卡验收、改代码的需求走 dispatch skill），流程细节都在 `skills/dispatch/SKILL.md`（2026-10-27 定）。
-12. 执行器加载 skill，和 261004 不同（原文："Pi 执行器启动时直接关掉 Skill"，规则从共用底座现场渲染进 prompt）。原因：用户要求执行器用上装好的 skill，规则只留 library 里一份。为了避开原文踩过的"整池 83 个 Skill 全塞了进来"，只传在 magpie Library 里勾了 pi 的 skill，每次运行检查有没有被读（2026-10-27 定）。
-13. 项目规则由 Pi 自己读，调度层只拼自己的角色声明、执行规则和卡（对应附录 05："Agent 进入项目前先读这个文件"）。原因：拼进 prompt 会把项目 AGENTS.md 算进 12KB 上限，eve 的 AGENTS.md 有 6KB，修复轮就会超；Pi 每级目录只取一个规则文件，不会重复注入。运行时的 12KB 检查去掉：文章的 12KB 管的是规则源，我们自己的执行规则约 2KB。项目统一用 AGENTS.md（2026-10-27 定）。
+12. 执行器不加载 skill，写代码规范直接渲染进 prompt，和 261004 一致（原文："Pi 执行器启动时直接关掉 Skill"，规则从共用底座现场渲染）。规范的来源是 magpie Library 里勾了 pi 的 skill 正文，只在 Library 里维护一份；渲染出的规则部分（角色声明 + 执行规则 + 写代码规范）上限 12KB，对应原文执行器侧的注入上限（2026-10-27 定稿，取代当天先做的"--skill 传给执行器、让它自己读"）。
+13. 项目规则由 Pi 自己读，调度层只拼自己的角色声明、执行规则和卡（对应附录 05："Agent 进入项目前先读这个文件"）。原因：拼进 prompt 会把项目 AGENTS.md 算进 12KB 上限，eve 的 AGENTS.md 有 6KB，修复轮就会超；Pi 每级目录只取一个规则文件，不会重复注入。12KB 上限只管我们渲染的规则部分（第 12 条），不含项目 AGENTS.md 和卡。项目统一用 AGENTS.md（2026-10-27 定）。
 14. 共用底座 = magpie Library 里的 skill（对应 261004 的"一份底稿"）：主脑和执行器都该遵守的写代码习惯，写成 Library 里的 skill，勾上各家工具和 pi，不只写进某一家的 CLAUDE.md，免得主脑有、执行器没有。Library 里的 Instructions（全局规则文件）进不了执行器：临时配置目录不带 `~/.pi/agent/AGENTS.md`（2026-10-27 定）。
 
 ## 8. 自测结果（2026-10-26，临时仓库，未用公司代码）
 
 一张 backend-logic / S 的卡：`agent-worktree` → `agent-dispatch`（exec-main / medium，实际 gpt-6.1-sol，执行器先写测试再实现、两次小步提交，1 分 24 秒）→ 门禁 GREEN → 人工注入 bug 后门禁 RED → 带修复说明派 fix-1 → GREEN → 修满 3 轮时 dispatch 返回 3 → `agent-advise`（astra / xhigh，只读）给出结论 → `agent-score` → `agent-merge` 合并并清理。
 另测：dispatch 的 9 个错误用例、门禁的 4 个判红用例（改 AGENTS.md、无代码块、改动未覆盖、超时）、score 的 2 个错误用例，均符合预期。测试数据已清理。
-2026-10-27 改成 Pi 自己读项目规则后复测（临时仓库，根目录同时放 AGENTS.md 和 CLAUDE.md）：本机抓包看 Pi 发出的请求，AGENTS.md 在系统提示里只出现 1 次，CLAUDE.md 没被读，prompt 里没有第二份；再派一张真实卡（exec-main / gpt-6.1-sol），`RUN: rules` 指向 worktree 的 AGENTS.md，提交信息按 AGENTS.md 的约定带上 `[selftest]` 前缀，karpathy-guidelines 已读，门禁 GREEN。
+2026-10-27 改成 Pi 自己读项目规则后复测（临时仓库，根目录同时放 AGENTS.md 和 CLAUDE.md）：本机抓包看 Pi 发出的请求，AGENTS.md 在系统提示里只出现 1 次，CLAUDE.md 没被读，prompt 里没有第二份；再派一张真实卡（exec-main / gpt-6.1-sol），`RUN: rules` 指向 worktree 的 AGENTS.md，提交信息按 AGENTS.md 的约定带上 `[selftest]` 前缀，门禁 GREEN。
 
 ## 9. TODO
 
