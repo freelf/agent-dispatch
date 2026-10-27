@@ -5,8 +5,12 @@
 #   写：只放开 worktree、它的 gitdir、objects、refs/heads/card、logs/refs/heads/card、临时目录；
 #       --read-only 时连 worktree 也不可写（Advisor 用）
 #   网：只允许连 localhost（magpie 网关），外网一律拦截
-#   Pi：独立配置目录 + PI_OFFLINE=1（不查更新、不发遥测）；不加载 skills / extensions / context files，
-#       规则底座由调用方拼进 prompt
+#   Pi：独立配置目录 + PI_OFFLINE=1（不查更新、不发遥测）；不加载 extensions
+#   项目规则：由 Pi 自己读（从 worktree 往上，每级目录取第一个 AGENTS.md / CLAUDE.md，放进系统提示）；
+#       临时配置目录里没有全局 AGENTS.md。跑之前按同样的规则查一遍，打印 RUN: rules，记在运行记录的 rules
+#   skills：只加载装给 Pi 的那些（$pi_home/skills，由 magpie library 维护，在 Library 里给 skill 勾上 pi），
+#       用 --skill 逐个显式传入，仍带 --no-skills，不扫 worktree 里的 .pi/.agents skills 和 ~/.agents/skills；
+#       跑完从事件里查每个 skill 的 SKILL.md 有没有被读过（Pi 只把描述放进系统提示，全文要模型自己去读）
 #   GIT_CONFIG_*：关掉提交后的 git maintenance，它要写主仓库 .git，在 sandbox 里会失败
 # 已知无害噪音：commit 结束后清理临时 ref 时要锁 packed-refs，会打印
 #   "Unable to create .../packed-refs.lock"，提交本身已成功。同理执行器不能用 git stash。
@@ -33,7 +37,6 @@ prompt=$2
 group=$3
 effort=$4
 label=$5
-prompt_limit=12288
 
 case $effort in
     low|medium|high|xhigh) ;;
@@ -44,11 +47,6 @@ case $label in
 esac
 if [ ! -f "$prompt" ]; then
     echo "RUN ERROR: prompt 文件不存在 $prompt" >&2
-    exit 2
-fi
-prompt_size=$(wc -c < "$prompt" | tr -d ' ')
-if [ "$prompt_size" -gt "$prompt_limit" ]; then
-    echo "RUN ERROR: prompt ${prompt_size} 字节，超过上限 ${prompt_limit}" >&2
     exit 2
 fi
 pi_home=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
@@ -85,6 +83,23 @@ cp "$pi_home/models.json" "$pi_dir/models.json"
 printf '{"enableInstallTelemetry": false}\n' > "$pi_dir/settings.json"
 trap 'rm -rf "$pi_dir"' EXIT
 
+: > "$run_dir/skills"
+for s in "$pi_home/skills"/*; do
+    [ -e "$s" ] && printf '%s\n' "$s" >> "$run_dir/skills"
+done
+
+# 和 Pi 的查找规则一致：从 worktree 往上，每级目录取第一个 AGENTS.md / CLAUDE.md，离根近的在前
+rules=
+d=$worktree
+while :; do
+    for f in AGENTS.md CLAUDE.md; do
+        if [ -e "$d/$f" ]; then rules="$d/$f${rules:+ $rules}"; break; fi
+    done
+    [ "$d" = / ] && break
+    d=$(dirname "$d")
+done
+printf '%s\n' "${rules:-无}" > "$run_dir/rules"
+
 write_profile() {
     echo '(version 1)'
     echo '(allow default)'
@@ -104,15 +119,18 @@ tools=read,bash,edit,write
 [ "$read_only" = true ] && tools=read,grep,find,ls,bash
 
 echo "RUN: card/$task_id $label group=$group effort=$effort 记录 $run_dir" >&2
+echo "RUN: rules ${rules:-无}" >&2
 rc=0
 (
     cd "$worktree"
+    set --
+    while IFS= read -r s; do set -- "$@" --skill "$s"; done < "$run_dir/skills"
     PI_CODING_AGENT_DIR=$pi_dir PI_OFFLINE=1 \
     GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=gc.auto GIT_CONFIG_VALUE_0=0 \
     GIT_CONFIG_KEY_1=maintenance.auto GIT_CONFIG_VALUE_1=false \
     sandbox-exec -f "$run_dir/sandbox.sb" \
         pi -p --mode json --model "magpie/group/$group" --thinking "$effort" \
-        --tools "$tools" --no-session --no-skills --no-extensions --no-context-files \
+        --tools "$tools" --no-session --no-skills --no-extensions "$@" \
         "$(cat "$run_dir/prompt.md")" </dev/null
 ) > "$run_dir/events.jsonl" 2> "$run_dir/stderr.log" || rc=$?
 
@@ -121,6 +139,10 @@ stop=$(python3 -I - "$run_dir" <<'EOF'
 import json, os, sys
 d = sys.argv[1]
 session, last = "", None
+skills = [s for s in open(os.path.join(d, "skills")).read().splitlines() if s]
+# 目录型 skill 读的是 <名字>/SKILL.md，文件型就是文件名本身；read 工具和 bash 里 cat 都算
+marks = {s: (os.path.basename(s) + "/SKILL.md" if os.path.isdir(s) else os.path.basename(s)) for s in skills}
+read = set()
 with open(os.path.join(d, "events.jsonl")) as f:
     for line in f:
         try:
@@ -129,6 +151,10 @@ with open(os.path.join(d, "events.jsonl")) as f:
             continue
         if e.get("type") == "session":
             session = e.get("id", "")
+        elif e.get("type") == "tool_execution_start":
+            args = e.get("args") or {}
+            seen = str(args.get("path", "")) + "\n" + str(args.get("command", ""))
+            read.update(s for s, m in marks.items() if m in seen)
         elif e.get("type") == "agent_end":
             msgs = [m for m in e.get("messages", []) if m.get("role") == "assistant"]
             last = msgs[-1] if msgs else None
@@ -139,10 +165,13 @@ if last:
     if last.get("errorMessage"):
         text += "\n[error] " + last["errorMessage"]
 open(os.path.join(d, "last.md"), "w").write(text + "\n")
+status = " ".join(os.path.basename(s) + ("(已读)" if s in read else "(未读)") for s in skills) or "无"
+open(os.path.join(d, "skills.status"), "w").write(status + "\n")
 print(last.get("stopReason", "") if last else "missing")
 EOF
 )
 echo "RUN: pi exit=$rc stop=$stop session=$(cat "$run_dir/session")" >&2
+echo "RUN: skills $(cat "$run_dir/skills.status")" >&2
 echo "$run_dir"
 if [ $rc -ne 0 ] || [ "$stop" = error ] || [ "$stop" = aborted ] || [ "$stop" = missing ]; then
     exit 1
