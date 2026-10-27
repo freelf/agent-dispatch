@@ -1,5 +1,5 @@
-# 配额感知路由的映射表：(task_type, 级别) → magpie 路由组 + 推理强度。
-# 组内具体用哪个模型、额度不够时降级给谁，由 magpie 按组的 routing=order 决定。
+# 任务 → 路由组映射表：(task_type, 级别) → magpie 路由组 + 推理强度。
+# 组成员、组内用哪个模型、额度和降级都由 magpie 维护，这里只管派到哪个组。
 # 初始值是拍的，按记分卡数据修正；改动请在 docs/plan.md 记原因。
 # task_type 词表定了不轻改，否则历史记分卡无法对比。
 # type	level	group	effort

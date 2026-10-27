@@ -1,13 +1,13 @@
 #!/bin/sh
 # 调度层入口：把一张任务卡派给执行器，跑完自动过门禁，把结果交回主脑。
-# 步骤：解析卡头 → 查映射表得到组和推理强度 → 查额度水位 → 渲染最终 prompt
+# 步骤：解析卡头 → 查映射表得到组和推理强度 → 渲染最终 prompt
 #       （角色声明 + 执行规则 + 项目 AGENTS.md + 卡正文 [+ 上一轮门禁输出 + 修复说明]）
 #       → agent-run → agent-gate → 从 magpie usage 查实际接请求的模型 → 写 dispatch.json。
 # worktree 由主脑事先用 agent-worktree 建好（并行、排队、基线由主脑决定），调度层不建也不合并。
 # 用法：agent-dispatch <worktree> <card.md> [fix-notes.md]
 #   第一次派发不带 fix-notes；门禁红（或主脑验收不通过）后由主脑写修复说明再派，同一张卡最多修 3 轮，超过要先找 Advisor。
-#   AGENT_QUOTA_MAX：额度水位百分比（缺省 90），组内所有成员的账号都超过就不派。
-# 退出码：0 执行器正常结束且门禁绿；1 执行器出错或门禁红；2 用法或环境错误；3 需要主脑处理（修满 3 轮、额度过线）；
+#   额度和降级不在这里管：由 magpie 按路由组自己调度。
+# 退出码：0 执行器正常结束且门禁绿；1 执行器出错或门禁红；2 用法或环境错误；3 需要主脑处理（修满 3 轮）；
 #   4 执行器正常结束，但项目未声明门禁、编译测试未验证，由主脑直接验收。
 set -eu
 
@@ -19,7 +19,6 @@ worktree=$1
 card=$2
 notes=${3:-}
 max_fix_rounds=3
-quota_max=${AGENT_QUOTA_MAX:-90}
 root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
 bin=$root/bin
 
@@ -48,7 +47,7 @@ for k in id type level base; do
 done
 case $level in
     S|M) ;;
-    L) echo "DISPATCH ERROR: L 级卡不能直接派，先拆成 M；拆不开先问 Advisor" >&2; exit 2 ;;
+    L) echo "DISPATCH ERROR: L 级卡不进执行器：按 dispatch SKILL「L 级怎么办」渐进拆分、先定骨架或走子代理路径" >&2; exit 2 ;;
     *) echo "DISPATCH ERROR: level 只能是 S 或 M: $level" >&2; exit 2 ;;
 esac
 if [ "$type" = context-coupled ]; then
@@ -76,32 +75,6 @@ if [ -z "$route" ]; then
 fi
 group=${route% *}
 effort=${route#* }
-
-# 额度水位：组内成员涉及的每个订阅，只要还有一个账号所有窗口都低于水位就能派
-# 成员行形如 "  models    1 codex/gpt-6-luna  ..." 或 "            2 codex/gpt-6.1-sol  ..."
-providers=$(magpie group "$group" 2>/dev/null | awk '{
-    for (i = 1; i < NF; i++) if ($i ~ /^[0-9]+$/ && $(i + 1) ~ /^[a-z0-9-]+\//) { split($(i + 1), a, "/"); print a[1]; break }
-}' | sort -u)
-if [ -z "$providers" ]; then
-    echo "DISPATCH ERROR: magpie 里找不到路由组 $group 或它没有成员" >&2
-    exit 2
-fi
-room=""
-for p in $providers; do
-    q=$(magpie quota "$p" --json 2>/dev/null) || { echo "DISPATCH ERROR: 读取 $p 额度失败" >&2; exit 2; }
-    ok=$(printf '%s' "$q" | python3 -I -c '
-import json, sys
-limit = float(sys.argv[1])
-accts = json.load(sys.stdin)
-print("yes" if any(all(w.get("used", 0) < limit for w in a.get("windows", [])) for a in accts) else "no")
-' "$quota_max")
-    echo "DISPATCH: 额度 $p 有余量=${ok}（水位 ${quota_max}%）" >&2
-    [ "$ok" = yes ] && room=yes
-done
-if [ -z "$room" ]; then
-    echo "DISPATCH STOP: 组 $group 的所有订阅都超过 ${quota_max}% 水位，不派" >&2
-    exit 3
-fi
 
 common_dir=$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir)
 repo=$(dirname "$common_dir")
