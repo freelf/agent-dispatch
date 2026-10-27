@@ -2,7 +2,7 @@
 # 调度层入口：把一张任务卡派给执行器，跑完自动过门禁，把结果交回主脑。
 # 步骤：解析卡头 → 查映射表得到组和推理强度 → 渲染最终 prompt
 #       （角色声明 + 执行规则 + 写代码规范 + 卡正文 [+ 上一轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读，见 agent-run）
-#   写代码规范 = magpie Library 里勾了 pi 的 skill（$pi_home/skills）的正文；执行器本身不加载 skill。
+#   写代码规范 = 共用底座 = magpie Library 里全部 skill 的正文（$library，不看给哪家勾了）；执行器本身不加载 skill。
 #   角色声明 + 执行规则 + 写代码规范合计不超过 12KB（对应 261004 执行器侧的注入上限），卡和修复说明不算。
 #       → agent-run → agent-gate → 从 magpie usage 查实际接请求的模型 → 写 dispatch.json。
 # worktree 由主脑事先用 agent-worktree 建好（并行、排队、基线由主脑决定），调度层不建也不合并。
@@ -22,7 +22,7 @@ card=$2
 notes=${3:-}
 max_fix_rounds=3
 rules_limit=12288
-pi_home=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+library=${AGENT_SKILL_LIBRARY:-$HOME/.config/magpie/library/skills}
 root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
 bin=$root/bin
 
@@ -122,7 +122,7 @@ trap 'rm -f "$prompt"' EXIT
 7. 最后的回复用几行写清：做了什么、提交了哪些、自查结果、没做完或有疑问的地方。
 8. 下面有「写代码规范」就照做。规范里要你「问用户」的地方没人可问，改为按最保守的理解做，在最后的回复里写明假设。
 EOF
-    for s in "$pi_home/skills"/*; do
+    for s in "$library"/*; do
         f=$s
         [ -d "$s" ] && f=$s/SKILL.md
         [ -f "$f" ] || continue
@@ -132,7 +132,7 @@ EOF
 } > "$prompt"
 rules_size=$(wc -c < "$prompt" | tr -d ' ')
 if [ "$rules_size" -gt "$rules_limit" ]; then
-    echo "DISPATCH ERROR: 角色声明 + 执行规则 + 写代码规范共 ${rules_size} 字节，超过上限 ${rules_limit}：在 magpie Library 里给 pi 少勾几个 skill" >&2
+    echo "DISPATCH ERROR: 角色声明 + 执行规则 + 写代码规范共 ${rules_size} 字节，超过上限 ${rules_limit}：magpie Library 里的 skill 太多，加之前先删掉不再需要的" >&2
     exit 2
 fi
 {

@@ -46,7 +46,8 @@ task_type 只能用：`scaffold-bulk` / `test-docs` / `backend-logic` / `refacto
 ## 2. 写卡
 
 模板：`~/.claude/skills/dispatch/card-template.md`。卡写到仓库外（如 `$TMPDIR/cards/<id>.md`），不要放进 worktree。
-- 只填内容：目标、非目标、修改边界、完成条件。角色声明、执行规则、写代码规范（magpie Library 里勾了 pi 的 skill 正文）由调度层渲染时加上；项目根目录的 AGENTS.md 由执行器（Pi）自己读。这些都不用写进卡。- 完成条件写成执行器要落成的测试用例，门禁跑项目测试时自然覆盖。
+- 只填内容：目标、非目标、修改边界、完成条件。角色声明、执行规则、写代码规范（magpie Library 里全部 skill 的正文，即共用底座）由调度层渲染时加上；项目根目录的 AGENTS.md 由执行器（Pi）自己读。这些都不用写进卡。
+- 完成条件写成执行器要落成的测试用例，门禁跑项目测试时自然覆盖。
 - 卡正文写得很长，说明该拆卡了。
 - 派发输出的 `RUN: rules` 是执行器读到的项目规则文件。显示"无"而项目有 AGENTS.md，多半是 AGENTS.md 既没入库也没被忽略，worktree 里没有它。
 
