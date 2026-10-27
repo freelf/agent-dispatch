@@ -1,0 +1,150 @@
+#!/bin/sh
+# 在任务卡 worktree 里无头运行执行器（Pi），模型由 magpie 路由组决定。
+# 一般由 agent-dispatch / agent-advise 调用，主脑不直接用。
+# 隔离措施（sandbox-exec，规则见 write_profile）：
+#   写：只放开 worktree、它的 gitdir、objects、refs/heads/card、logs/refs/heads/card、临时目录；
+#       --read-only 时连 worktree 也不可写（Advisor 用）
+#   网：只允许连 localhost（magpie 网关），外网一律拦截
+#   Pi：独立配置目录 + PI_OFFLINE=1（不查更新、不发遥测）；不加载 skills / extensions / context files，
+#       规则底座由调用方拼进 prompt
+#   GIT_CONFIG_*：关掉提交后的 git maintenance，它要写主仓库 .git，在 sandbox 里会失败
+# 已知无害噪音：commit 结束后清理临时 ref 时要锁 packed-refs，会打印
+#   "Unable to create .../packed-refs.lock"，提交本身已成功。同理执行器不能用 git stash。
+# 用法：agent-run [--read-only] <worktree> <prompt-file> <group> <effort> <label>
+#   group 为 magpie 路由组 id（如 exec-main）；effort 为 low/medium/high/xhigh；label 用于记录目录名。
+# 运行记录：<state>/runs/<仓库名>/<task-id>/<时间戳>-<label>/
+#   prompt.md、events.jsonl、stderr.log、last.md（执行器最后一条回复）、session（Pi 会话号 = magpie usage 的 session）
+#   <state> 缺省 ${XDG_STATE_HOME:-~/.local/state}/agent-dispatch，可用 AGENT_DISPATCH_STATE 覆盖。
+# 成功时 stdout 只输出运行记录目录。
+# 退出码：0 执行器正常结束；1 执行器出错（Pi 退出码非 0，或回复以 error/aborted 结束）；2 用法或环境错误。
+set -eu
+
+read_only=false
+if [ "${1:-}" = "--read-only" ]; then
+    read_only=true
+    shift
+fi
+if [ $# -ne 5 ]; then
+    echo "用法: $0 [--read-only] <worktree> <prompt-file> <group> <effort> <label>" >&2
+    exit 2
+fi
+worktree=$1
+prompt=$2
+group=$3
+effort=$4
+label=$5
+prompt_limit=12288
+
+case $effort in
+    low|medium|high|xhigh) ;;
+    *) echo "RUN ERROR: effort 只能是 low/medium/high/xhigh: $effort" >&2; exit 2 ;;
+esac
+case $label in
+    ''|*[!a-z0-9-]*) echo "RUN ERROR: label 只能含小写字母、数字、连字符: $label" >&2; exit 2 ;;
+esac
+if [ ! -f "$prompt" ]; then
+    echo "RUN ERROR: prompt 文件不存在 $prompt" >&2
+    exit 2
+fi
+prompt_size=$(wc -c < "$prompt" | tr -d ' ')
+if [ "$prompt_size" -gt "$prompt_limit" ]; then
+    echo "RUN ERROR: prompt ${prompt_size} 字节，超过上限 ${prompt_limit}" >&2
+    exit 2
+fi
+pi_home=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+if [ ! -f "$pi_home/models.json" ]; then
+    echo "RUN ERROR: 找不到 $pi_home/models.json，先运行 magpie pi group/exec-main 让 magpie 写入 Pi 配置" >&2
+    exit 2
+fi
+
+branch=$(git -C "$worktree" symbolic-ref --short -q HEAD) || {
+    echo "RUN ERROR: $worktree 不是 git 工作区或处于 detached HEAD" >&2
+    exit 2
+}
+case $branch in
+    card/*) task_id=${branch#card/} ;;
+    *) echo "RUN ERROR: $worktree 当前分支 $branch 不是 card/<task-id>，拒绝运行" >&2; exit 2 ;;
+esac
+
+worktree=$(cd "$worktree" && pwd -P)
+git_dir=$(git -C "$worktree" rev-parse --absolute-git-dir)
+common_dir=$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir)
+mkdir -p "$common_dir/refs/heads/card" "$common_dir/logs/refs/heads/card"
+tmp_dir=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+
+state=${AGENT_DISPATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch}
+stamp=$(date +%Y%m%d-%H%M%S)
+run_dir=$state/runs/$(basename "$(dirname "$common_dir")")/$task_id/$stamp-$label
+mkdir -p "$run_dir"
+cp "$prompt" "$run_dir/prompt.md"
+
+# Pi 运行时要写自己的配置目录，给它一份放在临时目录里的副本，不放开真正的 ~/.pi
+pi_dir=$tmp_dir/agent-pi-$task_id-$stamp
+mkdir -p "$pi_dir"
+cp "$pi_home/models.json" "$pi_dir/models.json"
+printf '{"enableInstallTelemetry": false}\n' > "$pi_dir/settings.json"
+trap 'rm -rf "$pi_dir"' EXIT
+
+write_profile() {
+    echo '(version 1)'
+    echo '(allow default)'
+    echo '(deny file-write*)'
+    echo '(allow file-write*'
+    if [ "$read_only" = false ]; then
+        echo "  (subpath \"$worktree\") (subpath \"$git_dir\") (subpath \"$common_dir/objects\")"
+        echo "  (subpath \"$common_dir/refs/heads/card\") (subpath \"$common_dir/logs/refs/heads/card\")"
+    fi
+    echo "  (subpath \"$tmp_dir\") (subpath \"/private/tmp\") (subpath \"/dev\"))"
+    echo '(deny network-outbound (remote ip "*:*"))'
+    echo '(allow network-outbound (remote ip "localhost:*"))'
+}
+write_profile > "$run_dir/sandbox.sb"
+
+tools=read,bash,edit,write
+[ "$read_only" = true ] && tools=read,grep,find,ls,bash
+
+echo "RUN: card/$task_id $label group=$group effort=$effort 记录 $run_dir" >&2
+rc=0
+(
+    cd "$worktree"
+    PI_CODING_AGENT_DIR=$pi_dir PI_OFFLINE=1 \
+    GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=gc.auto GIT_CONFIG_VALUE_0=0 \
+    GIT_CONFIG_KEY_1=maintenance.auto GIT_CONFIG_VALUE_1=false \
+    sandbox-exec -f "$run_dir/sandbox.sb" \
+        pi -p --mode json --model "magpie/group/$group" --thinking "$effort" \
+        --tools "$tools" --no-session --no-skills --no-extensions --no-context-files \
+        "$(cat "$run_dir/prompt.md")" </dev/null
+) > "$run_dir/events.jsonl" 2> "$run_dir/stderr.log" || rc=$?
+
+# 从事件里取会话号、最后一条回复和结束原因；Pi 遇到连接错误等也可能以 0 退出，必须看 stopReason
+stop=$(python3 -I - "$run_dir" <<'EOF'
+import json, os, sys
+d = sys.argv[1]
+session, last = "", None
+with open(os.path.join(d, "events.jsonl")) as f:
+    for line in f:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") == "session":
+            session = e.get("id", "")
+        elif e.get("type") == "agent_end":
+            msgs = [m for m in e.get("messages", []) if m.get("role") == "assistant"]
+            last = msgs[-1] if msgs else None
+open(os.path.join(d, "session"), "w").write(session + "\n")
+text = ""
+if last:
+    text = "".join(c.get("text", "") for c in last.get("content", []) if c.get("type") == "text")
+    if last.get("errorMessage"):
+        text += "\n[error] " + last["errorMessage"]
+open(os.path.join(d, "last.md"), "w").write(text + "\n")
+print(last.get("stopReason", "") if last else "missing")
+EOF
+)
+echo "RUN: pi exit=$rc stop=$stop session=$(cat "$run_dir/session")" >&2
+echo "$run_dir"
+if [ $rc -ne 0 ] || [ "$stop" = error ] || [ "$stop" = aborted ] || [ "$stop" = missing ]; then
+    exit 1
+fi
+exit 0

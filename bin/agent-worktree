@@ -1,0 +1,80 @@
+#!/bin/sh
+# 为一张任务卡建 worktree：从基线分支拉出 card/<task-id>，并把被 git 忽略的本机配置软链接进去。
+# 在目标仓库（主仓库或它的任意 worktree）里运行。
+# 软链接候选见 links；只链接主仓库里存在、worktree 里没有、且在 worktree 中被 git 忽略的项，
+#   这样入库的文件不会被替换，链接也不会弄脏工作区。
+# 用法：agent-worktree <task-id> [base-branch]
+#   base-branch 缺省为主仓库当前分支。
+#   worktree 目录缺省为 <主仓库同级>/<仓库名>-cards/<task-id>，可用 AGENT_CARDS_DIR 覆盖父目录。
+# 成功时 stdout 只输出 worktree 绝对路径，便于调度脚本捕获。
+# 退出码：0 成功，2 用法或环境错误。
+set -eu
+
+links="AGENTS.md CLAUDE.md .codex/skills .serena/project.yml .serena/project.local.yml"
+
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+    echo "用法: $0 <task-id> [base-branch]" >&2
+    exit 2
+fi
+task_id=$1
+
+case $task_id in
+    ''|*[!a-z0-9-]*|-*)
+        echo "WORKTREE ERROR: task-id 只能含小写字母、数字、连字符，且不能以连字符开头: $task_id" >&2
+        exit 2
+        ;;
+esac
+
+# 从当前目录推出主仓库根目录：common dir 是主仓库的 .git，在 worktree 里运行也一样
+common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+    echo "WORKTREE ERROR: 当前目录不在 git 仓库里" >&2
+    exit 2
+}
+repo=$(dirname "$common_dir")
+if [ "$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" != "$repo" ]; then
+    echo "WORKTREE ERROR: 无法确定主仓库根目录（$common_dir 不是 <repo>/.git）" >&2
+    exit 2
+fi
+
+if [ $# -eq 2 ]; then
+    base=$2
+else
+    base=$(git -C "$repo" symbolic-ref --short -q HEAD) || {
+        echo "WORKTREE ERROR: 主仓库处于 detached HEAD，请显式传入 base-branch" >&2
+        exit 2
+    }
+fi
+if ! git -C "$repo" rev-parse --verify --quiet "refs/heads/$base" >/dev/null; then
+    echo "WORKTREE ERROR: 找不到本地基线分支 $base" >&2
+    exit 2
+fi
+
+branch=card/$task_id
+if git -C "$repo" rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+    echo "WORKTREE ERROR: 分支 $branch 已存在" >&2
+    exit 2
+fi
+
+cards_dir=${AGENT_CARDS_DIR:-$(dirname "$repo")/$(basename "$repo")-cards}
+worktree=$cards_dir/$task_id
+if [ -e "$worktree" ]; then
+    echo "WORKTREE ERROR: 目录已存在 $worktree" >&2
+    exit 2
+fi
+
+mkdir -p "$cards_dir"
+git -C "$repo" worktree add -q -b "$branch" "$worktree" "$base" >&2
+
+for path in $links; do
+    if [ ! -e "$repo/$path" ] || [ -e "$worktree/$path" ] || [ -L "$worktree/$path" ]; then
+        continue
+    fi
+    if ! git -C "$worktree" check-ignore -q "$path"; then
+        continue
+    fi
+    mkdir -p "$(dirname "$worktree/$path")"
+    ln -s "$repo/$path" "$worktree/$path"
+    echo "WORKTREE: 已链接 $path" >&2
+done
+
+echo "$worktree"

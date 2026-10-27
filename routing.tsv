@@ -1,0 +1,16 @@
+# 配额感知路由的映射表：(task_type, 级别) → magpie 路由组 + 推理强度。
+# 组内具体用哪个模型、额度不够时降级给谁，由 magpie 按组的 routing=order 决定。
+# 初始值是拍的，按记分卡数据修正；改动请在 docs/plan.md 记原因。
+# task_type 词表定了不轻改，否则历史记分卡无法对比。
+# type	level	group	effort
+scaffold-bulk	S	exec-light	medium
+scaffold-bulk	M	exec-light	high
+test-docs	S	exec-light	high
+test-docs	M	exec-main	medium
+backend-logic	S	exec-main	medium
+backend-logic	M	exec-main	high
+refactor	S	exec-main	high
+refactor	M	exec-main	xhigh
+frontend-ui	S	exec-main	medium
+frontend-ui	M	exec-main	high
+advisor	-	advisor	xhigh

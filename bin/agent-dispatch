@@ -1,0 +1,229 @@
+#!/bin/sh
+# 调度层入口：把一张任务卡派给执行器，跑完自动过门禁，把结果交回主脑。
+# 步骤：解析卡头 → 查映射表得到组和推理强度 → 查额度水位 → 渲染最终 prompt
+#       （角色声明 + 执行规则 + 项目 AGENTS.md + 卡正文 [+ 上一轮门禁输出 + 修复说明]）
+#       → agent-run → agent-gate → 从 magpie usage 查实际接请求的模型 → 写 dispatch.json。
+# worktree 由主脑事先用 agent-worktree 建好（并行、排队、基线由主脑决定），调度层不建也不合并。
+# 用法：agent-dispatch <worktree> <card.md> [fix-notes.md]
+#   第一次派发不带 fix-notes；门禁红（或主脑验收不通过）后由主脑写修复说明再派，同一张卡最多修 3 轮，超过要先找 Advisor。
+#   AGENT_QUOTA_MAX：额度水位百分比（缺省 90），组内所有成员的账号都超过就不派。
+# 退出码：0 执行器正常结束且门禁绿；1 执行器出错或门禁红；2 用法或环境错误；3 需要主脑处理（修满 3 轮、额度过线）；
+#   4 执行器正常结束，但项目未声明门禁、编译测试未验证，由主脑直接验收。
+set -eu
+
+if [ $# -lt 2 ] || [ $# -gt 3 ]; then
+    echo "用法: $0 <worktree> <card.md> [fix-notes.md]" >&2
+    exit 2
+fi
+worktree=$1
+card=$2
+notes=${3:-}
+max_fix_rounds=3
+quota_max=${AGENT_QUOTA_MAX:-90}
+root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
+bin=$root/bin
+
+for f in "$card" ${notes:+"$notes"}; do
+    [ -f "$f" ] || { echo "DISPATCH ERROR: 文件不存在 $f" >&2; exit 2; }
+done
+
+# 卡头：第一对 --- 之间的 key: value
+field() {
+    awk -v k="$1" '
+        NR == 1 && $0 == "---" { inside = 1; next }
+        inside && $0 == "---" { exit }
+        inside && index($0, k ":") == 1 { v = substr($0, length(k) + 2); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit }
+    ' "$card"
+}
+id=$(field id)
+type=$(field type)
+level=$(field level)
+base=$(field base)
+for k in id type level base; do
+    eval "v=\$$k"
+    if [ -z "$v" ]; then
+        echo "DISPATCH ERROR: 卡头缺少 ${k}（见 skills/dispatch/card-template.md）" >&2
+        exit 2
+    fi
+done
+case $level in
+    S|M) ;;
+    L) echo "DISPATCH ERROR: L 级卡不能直接派，先拆成 M；拆不开先问 Advisor" >&2; exit 2 ;;
+    *) echo "DISPATCH ERROR: level 只能是 S 或 M: $level" >&2; exit 2 ;;
+esac
+if [ "$type" = context-coupled ]; then
+    echo "DISPATCH ERROR: context-coupled 的卡不走调度层，由主脑直接派 Claude 子代理" >&2
+    exit 2
+fi
+
+branch=$(git -C "$worktree" symbolic-ref --short -q HEAD) || {
+    echo "DISPATCH ERROR: $worktree 不是 git 工作区或处于 detached HEAD" >&2
+    exit 2
+}
+if [ "$branch" != "card/$id" ]; then
+    echo "DISPATCH ERROR: worktree 分支是 ${branch}，卡 id 是 ${id}，对不上" >&2
+    exit 2
+fi
+if ! git -C "$worktree" rev-parse --verify --quiet "refs/heads/$base" >/dev/null; then
+    echo "DISPATCH ERROR: 找不到基线分支 $base" >&2
+    exit 2
+fi
+
+route=$(awk -F '\t' -v t="$type" -v l="$level" '$1 == t && $2 == l { print $3, $4; exit }' "$root/routing.tsv")
+if [ -z "$route" ]; then
+    echo "DISPATCH ERROR: routing.tsv 里没有 $type / $level" >&2
+    exit 2
+fi
+group=${route% *}
+effort=${route#* }
+
+# 额度水位：组内成员涉及的每个订阅，只要还有一个账号所有窗口都低于水位就能派
+# 成员行形如 "  models    1 codex/gpt-6-luna  ..." 或 "            2 codex/gpt-6.1-sol  ..."
+providers=$(magpie group "$group" 2>/dev/null | awk '{
+    for (i = 1; i < NF; i++) if ($i ~ /^[0-9]+$/ && $(i + 1) ~ /^[a-z0-9-]+\//) { split($(i + 1), a, "/"); print a[1]; break }
+}' | sort -u)
+if [ -z "$providers" ]; then
+    echo "DISPATCH ERROR: magpie 里找不到路由组 $group 或它没有成员" >&2
+    exit 2
+fi
+room=""
+for p in $providers; do
+    q=$(magpie quota "$p" --json 2>/dev/null) || { echo "DISPATCH ERROR: 读取 $p 额度失败" >&2; exit 2; }
+    ok=$(printf '%s' "$q" | python3 -I -c '
+import json, sys
+limit = float(sys.argv[1])
+accts = json.load(sys.stdin)
+print("yes" if any(all(w.get("used", 0) < limit for w in a.get("windows", [])) for a in accts) else "no")
+' "$quota_max")
+    echo "DISPATCH: 额度 $p 有余量=${ok}（水位 ${quota_max}%）" >&2
+    [ "$ok" = yes ] && room=yes
+done
+if [ -z "$room" ]; then
+    echo "DISPATCH STOP: 组 $group 的所有订阅都超过 ${quota_max}% 水位，不派" >&2
+    exit 3
+fi
+
+common_dir=$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir)
+repo=$(dirname "$common_dir")
+state=${AGENT_DISPATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch}
+card_runs=$state/runs/$(basename "$repo")/$id
+prev=$(ls -d "$card_runs"/*-exec "$card_runs"/*-fix-* 2>/dev/null | sort | tail -1 || true)
+rounds_done=$(ls -d "$card_runs"/*-exec "$card_runs"/*-fix-* 2>/dev/null | wc -l | tr -d ' ')
+if [ "$rounds_done" -eq 0 ]; then
+    [ -z "$notes" ] || { echo "DISPATCH ERROR: 这张卡还没派过，第一次派发不带修复说明" >&2; exit 2; }
+    label=exec
+else
+    [ -n "$notes" ] || { echo "DISPATCH ERROR: 这张卡已派过 $rounds_done 轮，再派必须带修复说明（上一轮：${prev}）" >&2; exit 2; }
+    fix=$rounds_done
+    if [ "$fix" -gt "$max_fix_rounds" ]; then
+        echo "DISPATCH STOP: 已修 $max_fix_rounds 轮仍未通过，先用 agent-advise 请教 Advisor，再决定继续、换方案还是放弃" >&2
+        exit 3
+    fi
+    label=fix-$fix
+fi
+
+if git -C "$repo" cat-file -e "$base:AGENTS.md" 2>/dev/null; then
+    agents=$(git -C "$repo" show "$base:AGENTS.md")
+elif [ -f "$repo/AGENTS.md" ]; then
+    agents=$(cat "$repo/AGENTS.md")
+else
+    agents="（项目没有 AGENTS.md）"
+fi
+
+prompt=$(mktemp)
+trap 'rm -f "$prompt"' EXIT
+{
+    cat <<EOF
+# 角色
+
+你是执行器，只按下面这张任务卡完成任务。你不是主脑：不要再把任务派给别人，不要调用 agent-* 调度命令，不要 push，不要建 MR。
+
+# 执行规则
+
+1. 先写测试，再写实现。完成条件要落成项目里的测试用例。
+2. 小步提交：每完成一个小步骤就 git commit，提交信息用 \`<type>(<scope>): <description>\`。结束时工作区必须干净（全部提交，没有未跟踪文件）。
+3. 只改「修改边界」允许的文件。不要改 AGENTS.md。
+4. 以命令退出码判断成败，stderr 里的提示信息不算失败。
+5. 你在 sandbox 里：只能写当前 worktree，只能访问本机网络。遇到 Operation not permitted 或网络失败，不要尝试绕过，在最后的回复里说明。
+6. 提交前自查：项目 AGENTS.md 里有 agent-gate 代码块就跑它的 build/test 命令（合并前门禁会独立再跑一遍）；没有就按 AGENTS.md 里的构建、测试说明尽量自查，在回复里写明跑了哪些命令、结果如何、哪些在 sandbox 里跑不了。
+7. 最后的回复用几行写清：做了什么、提交了哪些、自查结果、没做完或有疑问的地方。
+
+# 项目规则（AGENTS.md）
+
+$agents
+
+# 任务卡
+
+EOF
+    awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm' "$card"
+    if [ -n "$notes" ]; then
+        echo
+        echo "# 修复（第 ${fix} 轮）"
+        echo
+        echo "上一轮的提交已在当前分支上。门禁输出："
+        echo
+        echo '```'
+        if [ -f "$prev/gate.txt" ]; then tail -80 "$prev/gate.txt"; else echo "（上一轮没有门禁输出）"; fi
+        echo '```'
+        echo
+        echo "主脑的修复说明："
+        echo
+        cat "$notes"
+    fi
+} > "$prompt"
+
+rc=0
+run_dir=$("$bin/agent-run" "$worktree" "$prompt" "$group" "$effort" "$label") || rc=$?
+if [ $rc -eq 2 ] || [ -z "$run_dir" ]; then
+    echo "DISPATCH ERROR: agent-run 启动失败" >&2
+    exit 2
+fi
+exec_rc=$rc
+cp "$card" "$run_dir/card.md"
+[ -n "$notes" ] && cp "$notes" "$run_dir/fix-notes.md"
+
+gate_rc=0
+AGENT_GATE_LOG_DIR=$run_dir/gate "$bin/agent-gate" "$worktree" "$base" > "$run_dir/gate.txt" 2>&1 || gate_rc=$?
+
+# magpie 记账可能比执行器结束晚一点
+sleep 2
+session=$(cat "$run_dir/session")
+served=$(magpie usage --csv --last 24h 2>/dev/null | python3 -I -c '
+import csv, sys
+seen = []
+for r in csv.DictReader(sys.stdin):
+    m = r.get("served_model", "")
+    if r.get("session") == sys.argv[1] and m and m not in seen:
+        seen.append(m)
+print(",".join(reversed(seen)))
+' "$session")
+
+python3 -I - "$run_dir/dispatch.json" "$id" "$(basename "$repo")" "$type" "$level" "$base" "$label" \
+    "$group" "$effort" "$session" "$served" "$exec_rc" "$gate_rc" <<'EOF'
+import json, sys
+out, task_id, repo, task_type, level, base, label, group, effort, session, served, exec_rc, gate_rc = sys.argv[1:]
+json.dump({
+    "task_id": task_id, "repo": repo, "task_type": task_type, "complexity": level, "base": base,
+    "label": label, "executor": "pi", "group": group, "effort": effort, "session": session,
+    "served_models": [m for m in served.split(",") if m], "exec_rc": int(exec_rc), "gate_rc": int(gate_rc),
+}, open(out, "w"), ensure_ascii=False, indent=2)
+EOF
+
+echo "===== 派发 card/${id}（${label}）====="
+echo "组 $group / ${effort}，实际模型 ${served:-未查到}，会话 $session"
+echo "记录 $run_dir"
+echo "----- 执行器最后回复（exit=${exec_rc}）-----"
+cat "$run_dir/last.md"
+echo "----- 门禁（exit=${gate_rc}）-----"
+cat "$run_dir/gate.txt"
+
+if [ $gate_rc -eq 2 ]; then
+    exit 2
+fi
+if [ $exec_rc -ne 0 ] || [ $gate_rc -eq 1 ]; then
+    exit 1
+fi
+if [ $gate_rc -eq 3 ]; then
+    exit 4
+fi
+exit 0

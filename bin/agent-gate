@@ -1,0 +1,143 @@
+#!/bin/sh
+# 门禁：卡分支合入基线前运行。通过标准只有两条：编译通过、测试通过。
+# 前提：工作区已全部提交、相对基线确实有新提交、卡分支没有改 AGENTS.md（防止执行器改门禁）。
+# 编译和测试命令由项目在 AGENTS.md 里声明，格式为一个语言标记为 agent-gate 的代码块：
+#     ```agent-gate
+#     build <命令>                   # 每次都跑
+#     test  project/Eve_Core/ <命令>  # 只有改到这个路径前缀（以 / 结尾）才跑
+#     test  none                     # 显式声明没有这一项
+#     ```
+#   build 全部通过才跑 test；命令在 worktree 根目录用 sh -c 执行，以退出码判断成败。
+#   AGENTS.md 从基线读：入库的读基线分支上的版本，被忽略的读主仓库根目录那份；卡分支里的版本不用。
+#   没有 AGENTS.md 或没有代码块：项目还没接入门禁，前提检查通过后返回 3（已跳过），不算绿，
+#     改动交给主脑直接验收。
+#   有代码块但 build 或 test 一行都没声明、或这次改动一条 build/test 都没覆盖到，判红（"没跑"不算通过）。
+# 用法：agent-gate <worktree> <base-branch>
+#   AGENT_GATE_LOG_DIR：每条命令的完整输出写到这里（缺省临时目录）；AGENT_GATE_TIMEOUT：单条命令超时秒数（缺省 1800）。
+# 退出码：0 绿，1 红，2 用法或环境错误，3 项目未声明门禁、已跳过编译测试。
+set -eu
+
+if [ $# -ne 2 ]; then
+    echo "用法: $0 <worktree> <base-branch>" >&2
+    exit 2
+fi
+worktree=$1
+base=$2
+timeout_s=${AGENT_GATE_TIMEOUT:-1800}
+
+if ! git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "GATE ERROR: $worktree 不是 git 工作区" >&2
+    exit 2
+fi
+if ! git -C "$worktree" rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+    echo "GATE ERROR: 找不到基线分支 $base" >&2
+    exit 2
+fi
+command -v timeout >/dev/null || { echo "GATE ERROR: 缺少 timeout 命令（brew install coreutils）" >&2; exit 2; }
+worktree=$(cd "$worktree" && pwd -P)
+repo=$(dirname "$(git -C "$worktree" rev-parse --path-format=absolute --git-common-dir)")
+log_dir=${AGENT_GATE_LOG_DIR:-$(mktemp -d)}
+mkdir -p "$log_dir"
+
+# 未提交的改动不在检查范围内，直接判红，避免漏检
+if [ -n "$(git -C "$worktree" status --porcelain)" ]; then
+    echo "GATE RED: 工作区有未提交或未跟踪的改动"
+    git -C "$worktree" status --short
+    exit 1
+fi
+# 没有新提交说明执行器没产出，不能当作通过
+if [ -z "$(git -C "$worktree" rev-list "$base..HEAD")" ]; then
+    echo "GATE RED: 相对 $base 没有新提交"
+    exit 1
+fi
+changed=$(git -C "$worktree" diff --name-only "$base...HEAD")
+if printf '%s\n' "$changed" | grep -qx 'AGENTS.md'; then
+    echo "GATE RED: 卡分支改了 AGENTS.md（规则底座和门禁声明只能在基线上改）"
+    exit 1
+fi
+
+if git -C "$repo" cat-file -e "$base:AGENTS.md" 2>/dev/null; then
+    agents=$(git -C "$repo" show "$base:AGENTS.md")
+    agents_src="$base:AGENTS.md"
+elif [ -f "$repo/AGENTS.md" ]; then
+    agents=$(cat "$repo/AGENTS.md")
+    agents_src="$repo/AGENTS.md"
+else
+    agents=""
+    agents_src="AGENTS.md（不存在）"
+fi
+skipped() {
+    echo "GATE SKIPPED: $agents_src 没有 agent-gate 代码块，项目未接入门禁，编译和测试未验证；$(git -C "$worktree" rev-list --count "$base..HEAD") 个提交交给主脑验收"
+    exit 3
+}
+spec=$(printf '%s\n' "$agents" | awk '
+    /^```agent-gate[[:space:]]*$/ { inside = 1; found = 1; next }
+    inside && /^```/ { inside = 0; next }
+    inside && NF && $1 !~ /^#/ { print }
+    END { if (!found) exit 3 }') || skipped
+
+touches() {
+    printf '%s\n' "$changed" | awk -v p="$1" 'index($0, p) == 1 { hit = 1 } END { exit !hit }'
+}
+
+red=0
+n=0
+for kind in build test; do
+    declared=0
+    ran=0
+    # 先落到文件再逐行读，避免管道子 shell 丢掉计数
+    printf '%s\n' "$spec" | awk -v k="$kind" '$1 == k' > "$log_dir/.$kind.spec"
+    while IFS= read -r line; do
+        declared=1
+        rest=$(printf '%s' "$line" | sed "s/^$kind[[:space:]]*//")
+        if [ "$rest" = none ]; then
+            ran=1
+            echo "GATE: $kind none（项目声明没有这一项）"
+            continue
+        fi
+        prefix=${rest%%[[:space:]]*}
+        case $prefix in
+            */)
+                cmd=$(printf '%s' "${rest#"$prefix"}" | sed 's/^[[:space:]]*//')
+                if ! touches "$prefix"; then
+                    echo "GATE: $kind 跳过（未改到 ${prefix}）: $cmd"
+                    continue
+                fi
+                ;;
+            *) cmd=$rest ;;
+        esac
+        n=$((n + 1))
+        log=$log_dir/$n-$kind.log
+        rc=0
+        (cd "$worktree" && timeout "$timeout_s" sh -c "$cmd") > "$log" 2>&1 || rc=$?
+        ran=1
+        if [ $rc -eq 0 ]; then
+            echo "GATE: $kind 通过: $cmd"
+        else
+            red=1
+            if [ $rc -eq 124 ]; then why="超时 ${timeout_s}s"; else why="exit=$rc"; fi
+            echo "GATE: $kind 失败（${why}）: $cmd"
+            echo "----- $log 最后 40 行 -----"
+            tail -40 "$log"
+            echo "-----"
+        fi
+    done < "$log_dir/.$kind.spec"
+    rm -f "$log_dir/.$kind.spec"
+    if [ $declared -eq 0 ]; then
+        echo "GATE: $kind 未声明（$agents_src 的 agent-gate 代码块里至少要有一行 ${kind}，没有就写 $kind none）"
+        red=1
+    elif [ $ran -eq 0 ]; then
+        echo "GATE: 本次改动没有被任何 $kind 命令覆盖，等于没检查"
+        red=1
+    fi
+    # 编译不过就不跑测试
+    if [ $red -ne 0 ]; then
+        break
+    fi
+done
+
+if [ $red -ne 0 ]; then
+    echo "GATE RED: 完整输出见 $log_dir"
+    exit 1
+fi
+echo "GATE GREEN: $(git -C "$worktree" rev-list --count "$base..HEAD") 个提交，编译和测试通过（输出见 ${log_dir}）"

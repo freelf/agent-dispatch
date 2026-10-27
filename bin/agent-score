@@ -1,0 +1,61 @@
+#!/bin/sh
+# 验收记分卡：主脑验收定局时记一条，好坏都记。字段沿用 06-acceptance-scorecard。
+# 卡类型、级别、组、实际接请求的模型、轮次、耗时从这张卡的运行记录自动填，主脑只给结果、两项分数和理由。
+# 在目标仓库（主仓库或它的任意 worktree）里运行。
+# 用法：agent-score <task-id> <outcome> <scope_discipline> <taste> <note>
+#   outcome：accepted / escalated / abandoned
+#   scope_discipline、taste：0-3（含义见 skills/dispatch/SKILL.md）；note 必填，写打分理由
+# 记录追加到 <state>/scorecard.jsonl。退出码：0 成功，2 用法或环境错误。
+set -eu
+
+if [ $# -ne 5 ]; then
+    echo "用法: $0 <task-id> <accepted|escalated|abandoned> <scope 0-3> <taste 0-3> <note>" >&2
+    exit 2
+fi
+case $2 in accepted|escalated|abandoned) ;; *) echo "SCORE ERROR: outcome 只能是 accepted/escalated/abandoned" >&2; exit 2 ;; esac
+for s in "$3" "$4"; do
+    case $s in 0|1|2|3) ;; *) echo "SCORE ERROR: 分数只能是 0-3: $s" >&2; exit 2 ;; esac
+done
+if [ -z "$(printf '%s' "$5" | tr -d '[:space:]')" ]; then
+    echo "SCORE ERROR: note 必填，打分要带理由" >&2
+    exit 2
+fi
+
+common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+    echo "SCORE ERROR: 当前目录不在 git 仓库里" >&2
+    exit 2
+}
+state=${AGENT_DISPATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch}
+card_runs=$state/runs/$(basename "$(dirname "$common_dir")")/$1
+
+python3 -I - "$card_runs" "$state/scorecard.jsonl" "$@" <<'EOF'
+import datetime, glob, json, os, sys
+card_runs, out, task_id, outcome, scope, taste, note = sys.argv[1:]
+runs = sorted(glob.glob(os.path.join(card_runs, "*-exec")) + glob.glob(os.path.join(card_runs, "*-fix-*")))
+metas = []
+for r in runs:
+    p = os.path.join(r, "dispatch.json")
+    if os.path.exists(p):
+        metas.append((r, json.load(open(p))))
+if not metas:
+    sys.exit(f"SCORE ERROR: 找不到 {task_id} 的派发记录（{card_runs}）")
+first_dir, first = metas[0]
+last_dir, last = metas[-1]
+start = datetime.datetime.strptime(os.path.basename(first_dir)[:15], "%Y%m%d-%H%M%S")
+end = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(last_dir, "dispatch.json")))
+models = []
+for _, m in metas:
+    models += [x for x in m.get("served_models", []) if x not in models]
+row = {
+    "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "task_id": task_id, "repo": last["repo"], "executor": last["executor"],
+    "group": last["group"], "effort": last["effort"], "model": ",".join(models),
+    "task_type": last["task_type"], "complexity": last["complexity"],
+    "rounds": len(metas), "wall_clock_min": round((end - start).total_seconds() / 60),
+    "outcome": outcome, "scope_discipline": int(scope), "taste": int(taste), "note": note,
+}
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "a") as f:
+    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+print("SCORE:", json.dumps(row, ensure_ascii=False))
+EOF

@@ -1,0 +1,73 @@
+#!/bin/sh
+# 卡分支验收后本地合并进基线分支，并清理 worktree 和卡分支。不推远端、不建 MR。
+# 步骤：门禁必须绿 → 在基线分支所在的工作区 merge --no-ff → 删除 worktree 和 card/<task-id>。
+#   项目未声明门禁（agent-gate 返回 3）时允许合并：前提检查已过，编译测试由主脑验收负责，会打印提示。
+# 冲突时自动 merge --abort，基线工作区恢复原状，worktree 保留。
+# 在目标仓库（主仓库或它的任意 worktree）里运行。
+# 用法：agent-merge <task-id> <base-branch>
+# 退出码：0 合并完成，1 门禁红或合并冲突，2 用法或环境错误。
+set -eu
+
+if [ $# -ne 2 ]; then
+    echo "用法: $0 <task-id> <base-branch>" >&2
+    exit 2
+fi
+task_id=$1
+base=$2
+branch=card/$task_id
+common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+    echo "MERGE ERROR: 当前目录不在 git 仓库里" >&2
+    exit 2
+}
+repo=$(dirname "$common_dir")
+
+# 从 worktree 列表里找卡分支和基线分支各自所在的目录
+find_worktree() {
+    git -C "$repo" worktree list --porcelain | awk -v ref="refs/heads/$1" '
+        /^worktree / { path = substr($0, 10) }
+        $0 == "branch " ref { print path; exit }'
+}
+card_wt=$(find_worktree "$branch")
+base_wt=$(find_worktree "$base")
+if [ -z "$card_wt" ]; then
+    echo "MERGE ERROR: 找不到 $branch 的 worktree" >&2
+    exit 2
+fi
+if [ -z "$base_wt" ]; then
+    echo "MERGE ERROR: 基线分支 $base 没有在任何工作区检出，无法合并" >&2
+    exit 2
+fi
+
+gate_rc=0
+"$(dirname "$0")/agent-gate" "$card_wt" "$base" || gate_rc=$?
+if [ $gate_rc -eq 3 ]; then
+    echo "MERGE: 项目未声明门禁，本次合并没有编译测试验证，依据是主脑验收" >&2
+elif [ $gate_rc -ne 0 ]; then
+    echo "MERGE STOP: 门禁未通过（exit=${gate_rc}），不合并" >&2
+    [ $gate_rc -eq 1 ] && exit 1
+    exit 2
+fi
+
+if [ -n "$(git -C "$base_wt" status --porcelain --untracked-files=no)" ]; then
+    echo "MERGE ERROR: 基线工作区 $base_wt 有未提交的改动，先处理后再合并" >&2
+    git -C "$base_wt" status --short --untracked-files=no >&2
+    exit 2
+fi
+
+if ! git -C "$base_wt" merge --no-ff --no-edit "$branch" >&2; then
+    # 冲突会留下 MERGE_HEAD；未跟踪文件挡路等失败不会开始合并，无需 abort
+    if git -C "$base_wt" rev-parse -q --verify MERGE_HEAD >/dev/null; then
+        git -C "$base_wt" merge --abort
+    fi
+    echo "MERGE RED: $branch 合入 $base 失败，已恢复基线工作区，worktree 保留在 $card_wt" >&2
+    exit 1
+fi
+
+# branch -d 只认主仓库当前 HEAD，base 检出在别的工作区时会误判未合并，所以自己确认后用 -D
+if ! git -C "$repo" merge-base --is-ancestor "$branch" "$base"; then
+    echo "MERGE ERROR: 合并后 $branch 仍不在 $base 中，未清理" >&2
+    exit 2
+fi
+git -C "$repo" worktree remove "$card_wt"
+git -C "$repo" branch -D "$branch" >&2
+echo "MERGE DONE: $branch 已合入 ${base}（$(git -C "$base_wt" rev-parse --short HEAD)），worktree 与分支已清理"
