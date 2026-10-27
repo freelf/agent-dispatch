@@ -1,9 +1,9 @@
 #!/bin/sh
 # 调度层入口：把一张任务卡派给执行器，跑完自动过门禁，把结果交回主脑。
 # 步骤：解析卡头 → 查映射表得到组和推理强度 → 渲染最终 prompt
-#       （角色声明 + 执行规则 + 写代码规范 + 卡正文 [+ 上一轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读，见 agent-run）
-#   写代码规范 = 共用底座 = magpie Library 里全部 skill 的正文（$library，不看给哪家勾了）；执行器本身不加载 skill。
-#   角色声明 + 执行规则 + 写代码规范合计不超过 12KB（对应 261004 执行器侧的注入上限），卡和修复说明不算。
+#       （执行器规则 rules/executor.md + 卡正文 [+ 上一轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读，见 agent-run）
+#   rules/executor.md = 角色声明 + 执行规则 + 写代码规范，对应 261004 执行器侧"共用底座里执行器用得上的部分 + 工具段落 + 角色声明"；
+#   不超过 12KB（261004 执行器侧的注入上限），卡和修复说明不算。执行器本身不加载 skill。
 #       → agent-run → agent-gate → 从 magpie usage 查实际接请求的模型 → 写 dispatch.json。
 # worktree 由主脑事先用 agent-worktree 建好（并行、排队、基线由主脑决定），调度层不建也不合并。
 # 用法：agent-dispatch <worktree> <card.md> [fix-notes.md]
@@ -22,9 +22,9 @@ card=$2
 notes=${3:-}
 max_fix_rounds=3
 rules_limit=12288
-library=${AGENT_SKILL_LIBRARY:-$HOME/.config/magpie/library/skills}
 root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
 bin=$root/bin
+rules=$root/rules/executor.md
 
 for f in "$card" ${notes:+"$notes"}; do
     [ -f "$f" ] || { echo "DISPATCH ERROR: 文件不存在 $f" >&2; exit 2; }
@@ -105,36 +105,12 @@ fi
 
 prompt=$(mktemp)
 trap 'rm -f "$prompt"' EXIT
-{
-    cat <<EOF
-# 角色
-
-你是执行器，只按下面这张任务卡完成任务。你不是主脑：不要再把任务派给别人，不要调用 agent-* 调度命令，不要 push，不要建 MR。
-
-# 执行规则
-
-1. 先写测试，再写实现。完成条件要落成项目里的测试用例。
-2. 小步提交：每完成一个小步骤就 git commit，提交信息按项目规则的约定，没有约定就用 \`<type>(<scope>): <description>\`。结束时工作区必须干净（全部提交，没有未跟踪文件）。
-3. 只改「修改边界」允许的文件。不要改 AGENTS.md。
-4. 以命令退出码判断成败，stderr 里的提示信息不算失败。
-5. 你在 sandbox 里：只能写当前 worktree，只能访问本机网络。遇到 Operation not permitted 或网络失败，不要尝试绕过，在最后的回复里说明。
-6. 提交前自查：系统提示里的项目规则（AGENTS.md）有 agent-gate 代码块就跑它的 build/test 命令（合并前门禁会独立再跑一遍）；没有就按项目规则里的构建、测试说明尽量自查，在回复里写明跑了哪些命令、结果如何、哪些在 sandbox 里跑不了。
-7. 最后的回复用几行写清：做了什么、提交了哪些、自查结果、没做完或有疑问的地方。
-8. 下面有「写代码规范」就照做。规范里要你「问用户」的地方没人可问，改为按最保守的理解做，在最后的回复里写明假设。
-EOF
-    for s in "$library"/*; do
-        f=$s
-        [ -d "$s" ] && f=$s/SKILL.md
-        [ -f "$f" ] || continue
-        printf '\n# 写代码规范：%s\n\n' "$(basename "$s")"
-        body "$f"
-    done
-} > "$prompt"
-rules_size=$(wc -c < "$prompt" | tr -d ' ')
+rules_size=$(wc -c < "$rules" | tr -d ' ')
 if [ "$rules_size" -gt "$rules_limit" ]; then
-    echo "DISPATCH ERROR: 角色声明 + 执行规则 + 写代码规范共 ${rules_size} 字节，超过上限 ${rules_limit}：magpie Library 里的 skill 太多，加之前先删掉不再需要的" >&2
+    echo "DISPATCH ERROR: 执行器规则 $rules 共 ${rules_size} 字节，超过上限 ${rules_limit}：加一条规则之前，先想清楚要删哪条" >&2
     exit 2
 fi
+cp "$rules" "$prompt"
 {
     echo
     echo "# 任务卡"
