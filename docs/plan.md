@@ -46,21 +46,24 @@ Claude 不跑无头、不进执行器路由组（订阅条款风险）。
 
 | 组件 | 位置 | 说明 |
 |---|---|---|
-| `agent-worktree <id> [base]` | bin/ | 从基线拉 `card/<id>`，worktree 在 `<仓库同级>/<仓库名>-cards/<id>`；把被忽略的 `AGENTS.md`、`CLAUDE.md`、`.codex/skills`、`.serena/*.yml` 软链接进去（只链主仓库有、worktree 没有、且被忽略的） |
-| `agent-dispatch <wt> <card> [fix-notes]` | bin/ | 调度层入口。解析卡头 → 查 `routing.tsv` → 渲染 prompt（`rules/executor.md`（≤12KB）+ 卡正文 [+ 上轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读）→ `agent-run` → `agent-gate` → 从 `magpie usage` 按会话号查实际模型 → 写 `dispatch.json`。退出码 0 绿 / 1 红 / 2 错误 / 3 需主脑处理（修满 3 轮） |
+| `agent-worktree <id> [base]` | bin/ | 从基线拉 `card/<id>`，worktree 在 `<仓库同级>/<仓库名>-cards/<id>`；把被忽略的 `AGENTS.md`、`CLAUDE.md`、`.codex/skills`、`.serena/*.yml` 和每一层被忽略的 `node_modules` 软链接进去（只链主仓库有、worktree 没有、且被忽略的；`node_modules/` 这类只匹配目录的规则管不到链接，改为建真目录再逐项链接） |
+| `agent-dispatch <wt> <card> [fix-notes]` | bin/ | 调度层入口。解析卡头 → 查 `routing.tsv` → 渲染 prompt（`rules/executor.md`（≤12KB）+ 卡正文 [+ 上轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读）→ `agent-run` → `agent-gate` → 从 `magpie usage` 按会话号查实际模型 → 写 `dispatch.json`（含本轮新增提交、相对基线的文件数和增删行数）。退出码 0 绿 / 1 红 / 2 错误 / 3 先请教 Advisor（修满 3 轮，或最近三轮门禁都红且每轮报的都和上一轮不同）/ 4 项目未声明门禁 |
 | `agent-run [--read-only] <wt> <prompt> <group> <effort> <label>` | bin/ | 在 sandbox 里跑 Pi，见第 5 节。检查 Pi 最后回复的 `stopReason`，`error/aborted` 判失败（Pi 出错也可能以 0 退出） |
 | `agent-gate <wt> <base>` | bin/ | 门禁，见第 6 节 |
-| `agent-advise <wt> <question>` | bin/ | Advisor：`advisor` 组、只读 sandbox、空白上下文；材料 = 卡 + 各轮门禁结论 + 改动概况 + 主脑的问题，不给执行器对话历史 |
+| `agent-advise <wt> <question>` | bin/ | Advisor：`advisor` 组、只读 sandbox、空白上下文；材料 = 卡 + 各轮门禁结论 + 改动概况 + 主脑的请教卡，不给执行器对话历史；请教卡三栏（机械事实 / 我的判断 / 我希望听到的答案），缺栏或没填拒绝 |
 | `agent-score <id> <outcome> <scope> <taste> <note>` | bin/ | 记分卡，字段沿用 06；组、模型、轮次、耗时从运行记录自动填；note 必填 |
-| `agent-merge <id> <base>` | bin/ | 门禁再跑一次，绿了在基线所在工作区 `merge --no-ff`；冲突 abort 并保留 worktree；成功后删 worktree 和卡分支 |
+| `agent-merge <id> <base>` | bin/ | 门禁再跑一次，绿了在基线所在工作区 `merge --no-ff`；冲突 abort 并保留 worktree；成功后删 worktree 和卡分支。合并提交末尾写追溯字段 `Agent-Card/Executor/Group/Models/Rounds/Sessions`（取自运行记录） |
+| `agent-stats [天数]` | bin/ | 记分卡交叉分析（附录 06）：按「组 × task_type × 级别」和实际模型出通过率、升级率、一次到位率、平均轮次、两项分数 |
+| `agent-selftest [--real]` | bin/ | 自检，见第 8 节。缺省把执行器请求发到本机抓包服务，不花模型钱；`--real` 再用真模型派一张小卡 |
 | `routing.tsv` | 根目录 | (task_type, 级别) → 组 + 推理强度 |
 | `rules/executor.md` | rules/ | 执行器规则：角色声明 + 执行规则 + 写代码规范（吸收自 karpathy-guidelines），≤12KB |
 | `skills/dispatch/SKILL.md` | → `~/.claude/skills/dispatch` | 主脑侧规则：分级、写卡、副本管理、修复、Advisor、验收打分、合并、接入新项目、复盘 |
 | `skills/dispatch/card-template.md` | 同上 | 卡模板：卡头 id/type/level/base/depends + 目标/非目标/修改边界/完成条件 |
+| `skills/dispatch/advise-template.md` | 同上 | 请教卡模板，三栏 |
 | `install.sh` | 根目录 | bin/ → `~/.local/bin`，skills/ → `~/.claude/skills`，可重复执行 |
 
 运行记录：`~/.local/state/agent-dispatch/runs/<仓库名>/<卡id>/<时间戳>-<exec|fix-N|advise>/`
-（prompt.md、card.md、events.jsonl、stderr.log、last.md、session、sandbox.sb、gate.txt、gate/、dispatch.json）。
+（prompt.md、card.md、fix-notes.md、rules、events.jsonl、stderr.log、last.md、session、sandbox.sb、gate.txt、gate/、dispatch.json；advise 轮另有 question.md）。
 记分卡：`~/.local/state/agent-dispatch/scorecard.jsonl`。
 
 ## 4. 选模型
@@ -135,12 +138,17 @@ AI 审查、规则式审查（OCR）、改动量、格式检查不在门禁里�
 12. 执行器不加载任何 skill，规则在派活时现场渲染，照 261004:135："执行器这一侧，是派活那一刻现场渲染的：只拿共用底座里执行器用得上的部分，加上它那家工具的段落，再拼上任务卡和角色声明。Pi 执行器启动时直接关掉 Skill"。执行器规则只有一个文件 `rules/executor.md`（角色声明 + 执行规则 + 写代码规范），上限 12KB（261004:139），"加一条规则之前，就必须先想清楚要删哪条"。skill 照 261004 处理：别人的 skill "最优解是吸收内化到自己的工作流里"（185），karpathy-guidelines 已原文吸收进 `rules/executor.md`；Library 里的 skill 只给主脑和交互式工具按需加载，执行器不加载（2026-10-27 定稿，取代当天先后做过的"--skill 让执行器自己读"和"把 Library 的 skill 正文拼进 prompt"）。
 13. 项目规则由 Pi 自己读，调度层只拼自己的角色声明、执行规则和卡（对应附录 05："Agent 进入项目前先读这个文件"）。原因：拼进 prompt 会把项目 AGENTS.md 算进 12KB 上限，eve 的 AGENTS.md 有 6KB，修复轮就会超；Pi 每级目录只取一个规则文件，不会重复注入。12KB 上限只管我们渲染的规则部分（第 12 条），不含项目 AGENTS.md 和卡。项目统一用 AGENTS.md（2026-10-27 定）。
 14. 执行器要遵守的写代码习惯只改 `rules/executor.md` 这一处；Library 里的 skill 和 Instructions 都进不了执行器（`--no-skills`，临时配置目录也不带 `~/.pi/agent/AGENTS.md`）（2026-10-27 定）。
+15. 2026-10-28 对照两篇文章补齐的机制：建 worktree 接上每一层 node_modules（261004「建工作目录…自动把每一层配置都接上」）；Advisor 请教卡三栏、「门禁连续两轮报出新问题」由脚本判（261004）；合并提交写追溯字段、`dispatch.json` 记提交和改动量（260809「每次提交都能追溯」）；`agent-stats` 交叉分析和一次到位率（附录 06、260809）；教训单按「这个坑现在还踩得到吗」关单（261004）；`agent-selftest` 每个检查都配已知该红的输入（261004「先喂一个已知答案为'否'的输入」「版本钉住了但行为没钉住」）；Claude Code 会话记录永久保留（261004 保留轨迹，`cleanupPeriodDays` 36500）。
+    没做的和原因：门禁里的 AI 审查 / OCR / 格式检查（第 5 条，门禁只管编译和测试）；额度水位和降级链（magpie 负责）；定时分诊、架构扫描、周复盘（要常驻调度器，现在作为 SKILL 第 8 节的手动步骤）；跨 Agent 共享记忆（只有一个主脑）；前端录屏验收（目前没有前端卡）；`.env`、`local.properties` 不链进 worktree（可能有密钥，会随请求发给模型商）。
 
 ## 8. 自测结果（2026-10-26，临时仓库，未用公司代码）
 
 一张 backend-logic / S 的卡：`agent-worktree` → `agent-dispatch`（exec-main / medium，实际 gpt-6.1-sol，执行器先写测试再实现、两次小步提交，1 分 24 秒）→ 门禁 GREEN → 人工注入 bug 后门禁 RED → 带修复说明派 fix-1 → GREEN → 修满 3 轮时 dispatch 返回 3 → `agent-advise`（astra / xhigh，只读）给出结论 → `agent-score` → `agent-merge` 合并并清理。
 另测：dispatch 的 9 个错误用例、门禁的 4 个判红用例（改 AGENTS.md、无代码块、改动未覆盖、超时）、score 的 2 个错误用例，均符合预期。测试数据已清理。
 2026-10-27 改成 Pi 自己读项目规则后复测（临时仓库，根目录同时放 AGENTS.md 和 CLAUDE.md）：本机抓包看 Pi 发出的请求，AGENTS.md 在系统提示里只出现 1 次，CLAUDE.md 没被读，prompt 里没有第二份；再派一张真实卡（exec-main / gpt-6.1-sol），`RUN: rules` 指向 worktree 的 AGENTS.md，提交信息按 AGENTS.md 的约定带上 `[selftest]` 前缀，门禁 GREEN。
+
+2026-10-28 固化成 `agent-selftest`（测试仓库建在状态目录下，不碰真实记分卡；全部通过就删掉）。离线 54 项：脚本里变量名不直接贴中文；worktree 链接顶层和嵌套 node_modules 后工作区干净；门禁 5 种该红的输入都红、正常改动绿、没声明门禁返回 3；规则文件超 12KB 拒绝派发；抓包看执行器实际上下文（AGENTS.md 恰好一次、不读同目录 CLAUDE.md、没有 skill 清单、用户消息以 `rules/executor.md` 开头、卡正文一次）并用不带 `--no-skills` 的对照组确认 skill 检查判得了红；`dispatch.json` 新字段；sandbox 写权限 6 项和外网；Advisor 请教卡校验和只读；连续新问题 / 同一问题 / 修满 3 轮三种停止条件；合并追溯字段、删 worktree 不动主仓库。`--real` 另 5 项（真模型 exec-light，门禁绿、提交带 `[selftest]`、只改边界内文件、合并提交查到实际模型），共 59 项通过。
+自检本身的反证：在仓库副本里分别植入 7 个 bug（去掉 `--no-skills`、不判连续新问题、合并不写追溯、链接不改真目录、sandbox 写权限全放开、请教卡不校验、变量贴中文），每个都让对应检查变红。这一步还查出自检脚本自己有一处 `$desc（` 在 `set -u` 下直接崩掉。
 
 ## 9. TODO
 
@@ -153,24 +161,24 @@ AI 审查、规则式审查（OCR）、改动量、格式检查不在门禁里�
 3. ~~第一张真实卡~~ 2026-10-27 在 eve-debug-tools 跑完 `pkg-ext-filter`（backend-logic / S，4 轮，全部 gpt-6.1-sol，执行器合计约 10 分钟、$0.49），主脑验收后合入本地 master `6b4b2c7`。坑见 `docs/lessons.md`。常驻规则是否生效还没在新会话里验证。
 4. 修第一张卡暴露的问题：
    - ~~项目没有 AGENTS.md 时退而拼 CLAUDE.md~~ 改为 Pi 自己读项目规则（第 7 节第 13 条），项目统一用 AGENTS.md。
-   - `agent-worktree` 按需把依赖目录（如 `node_modules`）链接进 worktree，让执行器能在 sandbox 里自查。
-   - 区分"修复轮"和"补充需求轮"（或补充需求另开新卡），免得补需求吃掉修复轮次、记分 rounds 失真。
+   - ~~`agent-worktree` 按需把依赖目录（如 `node_modules`）链接进 worktree~~ 每一层被忽略的 node_modules 自动链接（2026-10-28）。
+   - ~~区分"修复轮"和"补充需求轮"~~ 补充需求另开新卡、`depends` 写当前卡（dispatch SKILL 第 4 节，2026-10-28）。
 
 **跑通之后：调整任务和路由组**
 
 5. 按记分卡调整 `routing.tsv` 的分法和 magpie 组成员（S/M 的推理强度、task_type 是否简化）。
-6. Advisor 改用 Fable 子代理（`~/.claude/agents/advisor.md`，只读工具），请教卡改成三栏（机械事实 / 我的判断 / 我希望听到的答案）；`agent-advise`（astra）留作备用。要先确认 Fable 在当前 Claude 套餐下可用。
+6. ~~请教卡改成三栏~~ 已做，`agent-advise` 校验三栏（2026-10-28）。Advisor 不另建 Fable 子代理：`agent-advise` 已经是只读、空白上下文、更强模型；主脑主动请教时 SKILL 第 4 节已允许派 Claude 子代理。
 7. Pi 里隐藏 Claude 模型（`magpie visible pi`），防止误选订阅模型跑无头。
 
 **以后按需做**
 
-8. "门禁连续两轮报出新问题"这个 Advisor 信号目前靠主脑判断，没有自动化。
+8. ~~"门禁连续两轮报出新问题"自动化~~ `agent-dispatch` 返回 3（2026-10-28）。
 9. 执行器运行没有超时上限；并发上限（暂定 3）由主脑自管。
 10. 执行器 sandbox 按需放开构建缓存目录（如 `~/.gradle`），让执行器能在 sandbox 里自查。
 11. `agent-merge` 调用门禁时日志留在临时目录，可改为写进运行记录。
-12. 自测脚本：把第 8 节的流程固化下来，升级 Pi / magpie 后先跑（261004 的教训：版本钉住了行为没钉住）。
-13. `dispatch.json` 自动记实际改动的文件数和行数，用来校准主脑估的级别。
+12. ~~自测脚本~~ `agent-selftest`（2026-10-28），升级 Pi / magpie 或改脚本后先跑。
+13. ~~`dispatch.json` 自动记实际改动的文件数和行数~~ 已记 `diff_vs_base` 和本轮 `commits`（2026-10-28）。
 14. OCR 规则审查（文章推荐，可以配 DeepSeek Flash）；目前门禁只管编译和测试，要加先定放在哪一环。
 15. 你自己的仓库（如博客）把 AGENTS.md 里的验证命令改写成 `agent-gate` 代码块。
 16. 仓库提交作者是公司邮箱（`zhangdongpo@kuaishou.com`），个人仓库是否改成个人邮箱；是否推到私有远端。
-17. Claude Code 会话记录永久保留（`cleanupPeriodDays`）。
+17. ~~Claude Code 会话记录永久保留~~ `~/.claude/settings.json` 设 `cleanupPeriodDays: 36500`（2026-10-28，改前备份在 `~/.claude/settings.json.bak-agent-dispatch-20261027`）。

@@ -1,0 +1,406 @@
+#!/bin/sh
+# 调度体系自检：在一个临时仓库里把 worktree → 门禁 → 派发 → sandbox → Advisor → 合并整条链路走一遍。
+# 为什么要有（261004）：版本钉住了，行为没钉住——升级 Pi / magpie、改了脚本之后先跑它；
+#   任何判据写完之后，先喂一个已知答案为"否"的输入，确认它会变红。所以这里每个检查都配了该红的输入。
+# 缺省不花模型钱：执行器的请求发到本机一个抓包服务（一律回 400），只检查 Pi 实际发出去的上下文：
+#   项目 AGENTS.md 在系统提示里恰好一次、同目录的 CLAUDE.md 不读、没有 skill 清单、用户消息以 rules/executor.md 开头。
+#   另跑一次不带 --no-skills 的对照组，确认 skill 清单这条检查判得了红。
+# --real：再用真实模型派一张小卡，要求门禁绿、提交信息遵守测试仓库 AGENTS.md 的约定、合并提交带实际模型。
+# 测试仓库建在状态目录下（不放 /tmp，sandbox 本来就放开临时目录，越权测试会假通过），
+#   运行记录写到测试目录自己的 state，不碰真实记分卡。全部通过就删掉测试目录，有失败就保留供排查。
+# 用法：agent-selftest [--real]
+# 退出码：0 全部通过；1 有检查失败；2 用法或环境错误。
+set -eu
+
+real=0
+case ${1:-} in
+    '') ;;
+    --real) real=1 ;;
+    *) echo "用法: $0 [--real]" >&2; exit 2 ;;
+esac
+root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
+bin=$root/bin
+real_pi_home=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+[ -f "$real_pi_home/models.json" ] || { echo "SELFTEST ERROR: 找不到 $real_pi_home/models.json" >&2; exit 2; }
+command -v pi >/dev/null || { echo "SELFTEST ERROR: PATH 上没有 pi" >&2; exit 2; }
+
+home_state=${AGENT_DISPATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch}
+mkdir -p "$home_state/selftest"
+t=$(cd "$home_state/selftest" && pwd -P)/$(date +%Y%m%d-%H%M%S)
+tmp_dir=$(cd "${TMPDIR:-/tmp}" && pwd -P)
+case $t/ in
+    "$tmp_dir"/*|/private/tmp/*|/tmp/*) echo "SELFTEST ERROR: 测试目录 $t 在临时目录里，sandbox 越权测试会假通过" >&2; exit 2 ;;
+esac
+mkdir "$t"
+export AGENT_DISPATCH_STATE="$t/state"
+runs=$AGENT_DISPATCH_STATE/runs/proj
+
+stop_server() {
+    if [ -f "$t/server/pid" ]; then
+        kill "$(cat "$t/server/pid")" 2>/dev/null || true
+        rm -f "$t/server/pid"
+    fi
+}
+trap 'stop_server' EXIT
+
+pass=0
+fail=0
+ok() { pass=$((pass + 1)); echo "  ok    $1"; }
+bad() { fail=$((fail + 1)); echo "  FAIL  $1"; }
+# check <说明> <命令...>：命令必须成功；refuse：命令必须失败
+check() {
+    desc=$1; shift
+    if "$@" >/dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi
+}
+refuse() {
+    desc=$1; shift
+    if "$@" >/dev/null 2>&1; then bad "$desc"; else ok "$desc"; fi
+}
+# assert_rc <说明> <退出码> <输出里要有的文字> <命令...>
+assert_rc() {
+    desc=$1 want=$2 pat=$3; shift 3
+    rc=0
+    "$@" > "$t/out" 2>&1 || rc=$?
+    if [ $rc -eq "$want" ] && grep -qF -- "$pat" "$t/out"; then
+        ok "$desc"
+    else
+        bad "${desc}（exit=${rc}，期望 $want 且输出含「${pat}」）"
+        tail -15 "$t/out" | sed 's/^/        | /'
+    fi
+}
+# python 逐行打印「PASS|说明」或「FAIL|说明」，这里计数
+tally() {
+    while IFS='|' read -r r desc; do
+        if [ "$r" = PASS ]; then ok "$desc"; else bad "$desc"; fi
+    done < "$1"
+}
+section() { echo; echo "== $1"; }
+mkcard() {
+    printf -- '---\nid: %s\ntype: test-docs\nlevel: S\nbase: main\n---\n\n## 目标\n\nMARKER-CARD-7f3a %s\n' "$1" "$2" > "$t/$1.md"
+}
+seed() {
+    mkdir -p "$runs/$1/$2"
+    printf '%s\n' "$3" > "$runs/$1/$2/gate.txt"
+}
+commit_in() {
+    git -C "$1" add -A && git -C "$1" commit -qm "$2"
+}
+# sbw <sandbox 规则> <路径>：在 sandbox 里往这个路径写一个文件
+sbw() { sandbox-exec -f "$1" sh -c 'echo x > "$1"' _ "$2"; }
+
+# ---------- 测试仓库 ----------
+repo=$t/proj
+mkdir -p "$repo/sub" "$repo/node_modules/pkg" "$repo/sub/node_modules/x" "$repo/.pi/skills/selftest-skill" "$t/nohooks"
+cat > "$repo/AGENTS.md" <<'EOF'
+# selftest 仓库
+
+MARKER-AGENTS-7f3a 提交信息一律以 [selftest] 开头。
+
+```agent-gate
+build sh -n lib.sh
+test  sh test.sh
+```
+EOF
+echo 'MARKER-CLAUDE-7f3a 同目录有 AGENTS.md 时，执行器不该读到这个文件。' > "$repo/CLAUDE.md"
+printf 'add() {\n    echo $(($1 + $2))\n}\n' > "$repo/lib.sh"
+printf '. ./lib.sh\n[ "$(add 1 2)" = 3 ] || { echo "add 1 2 应为 3"; exit 1; }\n' > "$repo/test.sh"
+echo 'node_modules/' > "$repo/.gitignore"
+echo 'sub' > "$repo/sub/README"
+echo 'module.exports = 1' > "$repo/node_modules/pkg/index.js"
+echo 'module.exports = 2' > "$repo/sub/node_modules/x/y.js"
+printf -- '---\nname: selftest-skill\ndescription: agent-selftest 对照组用，执行器不该看到。\n---\n\nMARKER-SKILL-7f3a\n' > "$repo/.pi/skills/selftest-skill/SKILL.md"
+git -C "$repo" init -q -b main
+git -C "$repo" config user.name agent-selftest
+git -C "$repo" config user.email agent-selftest@localhost
+git -C "$repo" config commit.gpgsign false
+git -C "$repo" config core.hooksPath "$t/nohooks"
+commit_in "$repo" "init"
+cd "$repo"
+
+# ---------- 抓包服务：记下请求体，一律回 400 ----------
+mkdir "$t/server"
+cat > "$t/server.py" <<'EOF'
+import http.server, json, os, sys
+d = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode("utf-8", "replace")
+        with open(os.path.join(d, "capture.jsonl"), "a") as f:
+            f.write(json.dumps({"path": self.path, "body": body}, ensure_ascii=False) + "\n")
+        self.reply()
+    def do_GET(self):
+        self.reply()
+    def reply(self):
+        b = b'{"error":{"message":"agent-selftest capture","type":"invalid_request_error"}}'
+        self.send_response(400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def log_message(self, *a):
+        pass
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+open(os.path.join(d, "port"), "w").write(str(s.server_address[1]))
+# python3 可能是 pyenv 的壳，$! 不是真正的服务进程，进程号由服务自己写
+open(os.path.join(d, "pid"), "w").write(str(os.getpid()))
+s.serve_forever()
+EOF
+# 放进子 shell 里后台跑，停服务时 shell 不会打印 Terminated
+(python3 -I "$t/server.py" "$t/server" > "$t/server/log" 2>&1 &)
+i=0
+while [ ! -s "$t/server/pid" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+[ -s "$t/server/port" ] || { echo "SELFTEST ERROR: 抓包服务没起来，见 $t/server/log" >&2; exit 2; }
+port=$(cat "$t/server/port")
+cap=$t/server/capture.jsonl
+# Pi 配置：沿用真实的 magpie provider，只把地址指向抓包服务、密钥换成假的
+mkdir "$t/pihome"
+python3 -I - "$real_pi_home/models.json" "$t/pihome/models.json" "$port" <<'EOF'
+import json, sys
+src, dst, port = sys.argv[1:]
+d = json.load(open(src))
+p = d["providers"]["magpie"]
+p["baseUrl"] = f"http://127.0.0.1:{port}/v1"
+p["apiKey"] = "dummy"
+p.pop("headers", None)
+for m in p.get("models", []):
+    m.pop("headers", None)
+json.dump(d, open(dst, "w"), indent=2)
+EOF
+export PI_CODING_AGENT_DIR="$t/pihome"
+
+echo "agent-selftest：测试目录 $t"
+
+# ---------- 0. 脚本写法 ----------
+section "脚本：变量名后面不能直接跟中文（sh 会把全角标点当成变量名的一部分）"
+# 按字节查：$name 后面紧跟一个非 ASCII 字节；要写成 ${name}
+bare_var() {
+    perl -ne 'if (/\$[A-Za-z_]\w*[^\x00-\x7f]/) { print "$ARGV:$.: $_"; $hit = 1 } close ARGV if eof; END { exit !$hit }' "$@"
+}
+# 样本运行时拼出来，免得这一行自己被查出来
+printf 'echo "%sx（"\n' '$' > "$t/bare.sh"
+check "对照：已知写错的一行查得出来" bare_var "$t/bare.sh"
+if bare_var "$bin"/* "$root/install.sh" > "$t/bare.txt"; then
+    bad "下面这些地方要写成 \${变量名}"
+    sed 's/^/        | /' "$t/bare.txt"
+else
+    ok "bin/ 和 install.sh 里没有这种写法"
+fi
+
+# ---------- 1. worktree ----------
+section "worktree：链接依赖目录，不弄脏工作区"
+wt=$("$bin/agent-worktree" g1 main 2> "$t/worktree.log")
+check "顶层 node_modules 已链接" test -f "$wt/node_modules/pkg/index.js"
+check "嵌套的 sub/node_modules 已链接" test -f "$wt/sub/node_modules/x/y.js"
+check "链接后工作区干净（node_modules/ 只匹配目录的规则也管得到）" test -z "$(git -C "$wt" status --porcelain)"
+
+# ---------- 2. 门禁：每种该红的情况都要红 ----------
+section "门禁：已知该红的输入必须红，正常改动必须绿"
+assert_rc "没有新提交 → 红" 1 "没有新提交" "$bin/agent-gate" "$wt" main
+echo x > "$wt/stray.txt"
+assert_rc "有未提交的文件 → 红" 1 "未提交或未跟踪" "$bin/agent-gate" "$wt" main
+rm "$wt/stray.txt"
+echo '改门禁' >> "$wt/AGENTS.md"
+commit_in "$wt" "edit agents"
+assert_rc "卡分支改了 AGENTS.md → 红" 1 "改了 AGENTS.md" "$bin/agent-gate" "$wt" main
+git -C "$wt" reset -q --hard main
+printf 'add() {\n' > "$wt/lib.sh"
+commit_in "$wt" "break build"
+assert_rc "编译不过 → 红" 1 "build 失败" "$bin/agent-gate" "$wt" main
+git -C "$wt" reset -q --hard main
+printf 'add() {\n    echo $(($1 - $2))\n}\n' > "$wt/lib.sh"
+commit_in "$wt" "break test"
+assert_rc "测试不过 → 红" 1 "test 失败" "$bin/agent-gate" "$wt" main
+git -C "$wt" reset -q --hard main
+echo '# selftest' >> "$wt/lib.sh"
+commit_in "$wt" "harmless"
+assert_rc "正常改动 → 绿" 0 "GATE GREEN" "$bin/agent-gate" "$wt" main
+git -C "$repo" branch -q nogate main
+git -C "$repo" worktree add -q "$t/nogate" nogate
+printf '# 没有门禁声明\n' > "$t/nogate/AGENTS.md"
+commit_in "$t/nogate" "no gate"
+assert_rc "基线没声明门禁 → 跳过（返回 3，不算绿）" 3 "GATE SKIPPED" "$bin/agent-gate" "$wt" nogate
+
+# ---------- 3. 执行器规则上限 ----------
+section "执行器规则：不超过 12KB"
+check "rules/executor.md 不超过 12288 字节" test "$(wc -c < "$root/rules/executor.md")" -le 12288
+mkdir -p "$t/fakeroot/rules"
+cp -R "$bin" "$root/routing.tsv" "$t/fakeroot/"
+head -c 13000 /dev/zero | tr '\0' x > "$t/fakeroot/rules/executor.md"
+mkcard g1 "超限检查"
+assert_rc "规则文件超过 12KB → 拒绝派发" 2 "超过上限" "$t/fakeroot/bin/agent-dispatch" "$wt" "$t/g1.md"
+
+# ---------- 4. 派发：抓包看执行器实际收到的上下文 ----------
+section "派发：执行器实际收到的上下文（抓包，不花模型钱）"
+wt=$("$bin/agent-worktree" c1 main 2>> "$t/worktree.log")
+echo '# selftest' >> "$wt/lib.sh"
+commit_in "$wt" "pre-existing"
+mkcard c1 "抓包检查，不要真的执行。"
+: > "$cap"
+assert_rc "执行器报错 → 派发返回 1，打印读到的项目规则" 1 "RUN: rules $wt/AGENTS.md" "$bin/agent-dispatch" "$wt" "$t/c1.md"
+c1_run=$(ls -d "$runs"/c1/*-exec | tail -1)
+python3 -I - "$cap" "$root/rules/executor.md" "$c1_run" "$wt/AGENTS.md" > "$t/tally" <<'EOF'
+import json, sys
+cap, rules_path, run, agents = sys.argv[1:]
+def say(c, d): print(("PASS|" if c else "FAIL|") + d)
+reqs = [json.loads(l) for l in open(cap) if l.strip()]
+if not reqs:
+    say(False, "抓包：没收到执行器的请求")
+    sys.exit()
+raw = reqs[0]["body"]
+msgs = json.loads(raw).get("messages", [])
+text = lambda c: c if isinstance(c, str) else "".join(p.get("text", "") for p in c or [])
+system = "".join(text(m.get("content")) for m in msgs if m.get("role") in ("system", "developer"))
+user = "".join(text(m.get("content")) for m in msgs if m.get("role") == "user")
+rules = open(rules_path).read().strip()
+say(system.count("MARKER-AGENTS-7f3a") == 1, "系统提示里项目 AGENTS.md 恰好出现一次")
+say("MARKER-CLAUDE-7f3a" not in raw, "同目录有 AGENTS.md 时不读 CLAUDE.md")
+say("<available_skills>" not in system and "MARKER-SKILL-7f3a" not in raw, "没有 skill 清单（--no-skills 生效）")
+say(user.startswith(rules), "用户消息以 rules/executor.md 开头")
+say(rules[:200] not in system, "执行器规则没有重复进系统提示")
+say(user.count("MARKER-CARD-7f3a") == 1, "任务卡正文在用户消息里出现一次")
+say(open(run + "/rules").read().strip() == agents, "运行记录 rules 指向 worktree 的 AGENTS.md")
+m = json.load(open(run + "/dispatch.json"))
+say(m["head_before"] == m["head_after"] and m["commits"] == [], "dispatch.json：执行器没提交，本轮提交为空")
+say(m["diff_vs_base"] == {"files": 1, "insertions": 1, "deletions": 0}, "dispatch.json：相对基线的累计改动量")
+say(m["served_models"] == [] and m["exec_rc"] == 1 and m["gate_rc"] == 0, "dispatch.json：退出码和实际模型（抓包不经过 magpie，应为空）")
+EOF
+tally "$t/tally"
+
+# 对照组：同样的仓库，Pi 不带 --no-skills，skill 清单应该出现；不出现说明上面那条判不了红
+mkdir "$t/pictl"
+cp "$t/pihome/models.json" "$t/pictl/models.json"
+: > "$cap"
+(cd "$wt" && PI_CODING_AGENT_DIR=$t/pictl PI_OFFLINE=1 pi -p --mode json --model magpie/group/exec-light \
+    --no-session --no-extensions "selftest control" < /dev/null > /dev/null 2>&1) || true
+python3 -I - "$cap" > "$t/tally" <<'EOF'
+import json, sys
+reqs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+hit = bool(reqs) and "selftest-skill" in reqs[0]["body"] and "available_skills" in reqs[0]["body"]
+print(("PASS|" if hit else "FAIL|") + "对照组：不带 --no-skills 时能看到项目 skill（skill 清单检查判得了红）")
+EOF
+tally "$t/tally"
+
+# ---------- 5. sandbox：用 agent-run 生成的规则直接试 ----------
+section "sandbox：写权限和网络"
+sb=$c1_run/sandbox.sb
+check "worktree 可写" sbw "$sb" "$wt/.sb-probe"
+check "卡分支的 ref 目录可写（执行器要能提交）" sbw "$sb" "$repo/.git/refs/heads/card/.sb-probe"
+refuse "主仓库工作区不可写" sbw "$sb" "$repo/.sb-escape"
+refuse "基线分支的 ref 不可写" sbw "$sb" "$repo/.git/refs/heads/.sb-escape"
+refuse "状态目录（临时目录之外）不可写" sbw "$sb" "$t/.sb-escape"
+refuse "home 不可写" sbw "$sb" "$HOME/.agent-selftest-escape"
+rm -f "$wt/.sb-probe" "$repo/.git/refs/heads/card/.sb-probe" "$repo/.sb-escape" "$repo/.git/refs/heads/.sb-escape" \
+    "$t/.sb-escape" "$HOME/.agent-selftest-escape"
+check "本机网关（localhost）能连" sandbox-exec -f "$sb" curl -s -o /dev/null -m 3 "http://127.0.0.1:$port/"
+if curl -s -o /dev/null -m 5 https://www.apple.com; then
+    refuse "外网不通（sandbox 外能连，sandbox 里必须连不上）" sandbox-exec -f "$sb" curl -s -o /dev/null -m 5 https://www.apple.com
+else
+    echo "  skip  外网检查：本机现在 sandbox 外也连不上外网，这条判不了"
+fi
+
+# ---------- 6. Advisor ----------
+section "Advisor：请教卡三栏必填，只读"
+cp "$root/skills/dispatch/advise-template.md" "$t/ask-empty.md"
+assert_rc "空模板 → 拒绝，列出三栏" 2 "没填：机械事实 我的判断 我希望听到的答案" "$bin/agent-advise" "$wt" "$t/ask-empty.md"
+sed '/^## 机械事实/a\
+修了 2 轮，门禁两次报的问题不同。' "$t/ask-empty.md" > "$t/ask-part.md"
+assert_rc "只填一栏 → 拒绝，列出缺的两栏" 2 "没填：我的判断 我希望听到的答案" "$bin/agent-advise" "$wt" "$t/ask-part.md"
+sed -e '/^## 我的判断/a\
+问题出在 lib.sh。' -e '/^## 我希望听到的答案/a\
+MARKER-ASK-7f3a 继续修。' "$t/ask-part.md" > "$t/ask-full.md"
+: > "$cap"
+assert_rc "三栏填满 → 交给 Advisor（抓包回 400，返回 1）" 1 "ADVISE: 记录" "$bin/agent-advise" "$wt" "$t/ask-full.md"
+check "Advisor 收到了请教卡" grep -q "MARKER-ASK-7f3a" "$cap"
+advise_run=$(ls -d "$runs"/c1/*-advise | tail -1)
+refuse "Advisor 的只读 sandbox 里 worktree 不可写" sbw "$advise_run/sandbox.sb" "$wt/.sb-escape"
+rm -f "$wt/.sb-escape"
+
+# ---------- 7. 派发的停止条件 ----------
+section "派发：什么时候必须先请教 Advisor"
+echo "修复说明" > "$t/notes.md"
+"$bin/agent-worktree" n1 main > /dev/null 2>> "$t/worktree.log"
+mkcard n1 "连续新问题"
+seed n1 20000101-000000-exec "GATE RED: 甲"
+seed n1 20000101-000001-fix-1 "GATE RED: 乙"
+assert_rc "门禁连续两轮报出新问题 → 返回 3" 3 "门禁连续两轮报出新问题" "$bin/agent-dispatch" "$t/proj-cards/n1" "$t/n1.md" "$t/notes.md"
+"$bin/agent-worktree" n2 main > /dev/null 2>> "$t/worktree.log"
+mkcard n2 "同一个问题"
+seed n2 20000101-000000-exec "GATE RED: 甲"
+seed n2 20000101-000001-fix-1 "GATE RED: 相对 main 没有新提交"
+assert_rc "最近两轮门禁报的是同一个问题 → 正常返回 1" 1 "GATE RED: 相对 main 没有新提交" "$bin/agent-dispatch" "$t/proj-cards/n2" "$t/n2.md" "$t/notes.md"
+refuse "…且不触发「连续两轮新问题」" grep -q "连续两轮" "$t/out"
+"$bin/agent-worktree" n3 main > /dev/null 2>> "$t/worktree.log"
+mkcard n3 "修满"
+for r in 20000101-000000-exec 20000101-000001-fix-1 20000101-000002-fix-2 20000101-000003-fix-3; do
+    seed n3 "$r" "GATE RED: 甲"
+done
+assert_rc "修满 3 轮 → 返回 3" 3 "已修 3 轮" "$bin/agent-dispatch" "$t/proj-cards/n3" "$t/n3.md" "$t/notes.md"
+
+# ---------- 8. 合并 ----------
+section "合并：追溯字段，删 worktree 不动主仓库"
+wt=$("$bin/agent-worktree" m1 main 2>> "$t/worktree.log")
+echo '# m1' >> "$wt/lib.sh"
+commit_in "$wt" "m1 change"
+mkdir -p "$runs/m1/20000101-000000-exec"
+printf '{"executor": "pi", "group": "exec-light", "effort": "high", "served_models": ["model-a"], "session": "sess-a", "base": "main"}\n' \
+    > "$runs/m1/20000101-000000-exec/dispatch.json"
+assert_rc "门禁绿 → 合并" 0 "MERGE DONE" "$bin/agent-merge" m1 main
+git -C "$repo" log -1 --format=%B main > "$t/msg"
+for f in "Agent-Card: m1" "Agent-Executor: pi" "Agent-Group: exec-light/high" "Agent-Models: model-a" "Agent-Rounds: 1" "Agent-Sessions: sess-a"; do
+    check "合并提交带 $f" grep -qx "$f" "$t/msg"
+done
+check "worktree 已删除" test ! -e "$wt"
+check "主仓库的 node_modules 还在" test -f "$repo/node_modules/pkg/index.js" -a -f "$repo/sub/node_modules/x/y.js"
+wt=$("$bin/agent-worktree" m2 main 2>> "$t/worktree.log")
+echo '# m2' >> "$wt/lib.sh"
+commit_in "$wt" "m2 change"
+assert_rc "没有派发记录也能合并" 0 "MERGE DONE" "$bin/agent-merge" m2 main
+git -C "$repo" log -1 --format=%B main > "$t/msg"
+check "…合并提交写明无派发记录" grep -q "Agent-Executor: 无派发记录" "$t/msg"
+
+# ---------- 9. 真实派发（--real） ----------
+if [ $real -eq 1 ]; then
+    section "真实派发：真模型做一张小卡"
+    export PI_CODING_AGENT_DIR="$real_pi_home"
+    wt=$("$bin/agent-worktree" r1 main 2>> "$t/worktree.log")
+    cat > "$t/r1.md" <<'EOF'
+---
+id: r1
+type: test-docs
+level: S
+base: main
+---
+
+## 目标
+
+在 test.sh 末尾加一条用例：`add 2 3` 等于 5，不等就打印原因并 exit 1。
+
+## 非目标
+
+不改 lib.sh。
+
+## 修改边界
+
+只改 test.sh。
+
+## 完成条件
+
+`sh test.sh` 通过。
+EOF
+    assert_rc "真实派发 → 门禁绿" 0 "GATE GREEN" "$bin/agent-dispatch" "$wt" "$t/r1.md"
+    check "执行器的提交遵守项目 AGENTS.md（[selftest] 开头）" sh -c 'git -C "$1" log --format=%s main..HEAD | grep -q "^\[selftest\]"' _ "$wt"
+    check "执行器只改了 test.sh" test "$(git -C "$wt" diff --name-only main...HEAD)" = test.sh
+    assert_rc "合并真实派发的卡" 0 "MERGE DONE" "$bin/agent-merge" r1 main
+    git -C "$repo" log -1 --format=%B main > "$t/msg"
+    refuse "合并提交查到了实际模型" grep -qx "Agent-Models: 未查到" "$t/msg"
+fi
+
+echo
+echo "agent-selftest：通过 $pass 项，失败 $fail 项"
+stop_server
+if [ $fail -ne 0 ]; then
+    echo "测试目录保留在 $t" >&2
+    exit 1
+fi
+cd /
+rm -rf "$t"
