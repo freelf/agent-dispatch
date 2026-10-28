@@ -3,6 +3,8 @@
 # 步骤：门禁必须绿 → 在基线分支所在的工作区 merge --no-ff → 删除 worktree 和 card/<task-id>。
 #   项目未声明门禁（agent-gate 返回 3）时允许合并：前提检查已过，编译测试由主脑验收负责，会打印提示。
 # 冲突时自动 merge --abort，基线工作区恢复原状，worktree 保留。
+# 合并提交末尾写追溯字段（260809「每次提交都能追溯到谁干的」）：卡、执行器、组、实际模型、轮次、Pi 会话号，
+#   从这张卡的运行记录取；卡分支上的每个提交都能顺着合并提交找到是谁做的。
 # 在目标仓库（主仓库或它的任意 worktree）里运行。
 # 用法：agent-merge <task-id> <base-branch>
 # 退出码：0 合并完成，1 门禁红或合并冲突，2 用法或环境错误。
@@ -20,6 +22,7 @@ common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) 
     exit 2
 }
 repo=$(dirname "$common_dir")
+state=${AGENT_DISPATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch}
 
 # 从 worktree 列表里找卡分支和基线分支各自所在的目录
 find_worktree() {
@@ -54,7 +57,30 @@ if [ -n "$(git -C "$base_wt" status --porcelain --untracked-files=no)" ]; then
     exit 2
 fi
 
-if ! git -C "$base_wt" merge --no-ff --no-edit "$branch" >&2; then
+trailers=$(python3 -I - "$state/runs/$(basename "$repo")/$task_id" "$task_id" <<'EOF'
+import glob, json, os, sys
+d, task_id = sys.argv[1:]
+runs = sorted(glob.glob(os.path.join(d, "*-exec")) + glob.glob(os.path.join(d, "*-fix-*")))
+metas = [json.load(open(os.path.join(r, "dispatch.json"))) for r in runs if os.path.exists(os.path.join(r, "dispatch.json"))]
+lines = [f"Agent-Card: {task_id}"]
+if metas:
+    models = []
+    for m in metas:
+        models += [x for x in m.get("served_models", []) if x not in models]
+    last = metas[-1]
+    lines += [
+        f"Agent-Executor: {last['executor']}",
+        f"Agent-Group: {last['group']}/{last['effort']}",
+        f"Agent-Models: {','.join(models) or '未查到'}",
+        f"Agent-Rounds: {len(metas)}",
+        f"Agent-Sessions: {','.join(m['session'] for m in metas)}",
+    ]
+else:
+    lines.append("Agent-Executor: 无派发记录（子代理路径或手工）")
+print("\n".join(lines))
+EOF
+)
+if ! git -C "$base_wt" merge --no-ff -m "Merge branch '$branch' into $base" -m "$trailers" "$branch" >&2; then
     # 冲突会留下 MERGE_HEAD；未跟踪文件挡路等失败不会开始合并，无需 abort
     if git -C "$base_wt" rev-parse -q --verify MERGE_HEAD >/dev/null; then
         git -C "$base_wt" merge --abort

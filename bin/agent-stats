@@ -1,0 +1,55 @@
+#!/bin/sh
+# 记分卡交叉分析（06-acceptance-scorecard「按执行器 × 任务类型做一次交叉分析」）：
+#   按「组 × task_type × 级别」和「实际模型」汇总通过率、升级率、一次到位率、平均轮次和两项分数，
+#   作为调整 routing.tsv 和 magpie 组成员的证据。复盘时跑，不靠印象改路由。
+# 一次到位率（260809）：accepted 且只派了 1 轮，中间没有修复轮。
+# 用法：agent-stats [天数]   缺省统计全部记录；给天数就只看最近这些天。
+# 读 <state>/scorecard.jsonl。退出码：0 正常，2 用法错误或没有记录。
+set -eu
+
+if [ $# -gt 1 ]; then
+    echo "用法: $0 [天数]" >&2
+    exit 2
+fi
+days=${1:-0}
+case $days in
+    ''|*[!0-9]*) echo "用法: $0 [天数]" >&2; exit 2 ;;
+esac
+state=${AGENT_DISPATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch}
+
+python3 -I - "$state/scorecard.jsonl" "$days" <<'EOF'
+import collections, datetime, json, os, sys
+path, days = sys.argv[1], int(sys.argv[2])
+if not os.path.exists(path):
+    sys.exit(f"STATS ERROR: 还没有记分记录（{path}）")
+rows = [json.loads(l) for l in open(path) if l.strip()]
+if days:
+    since = datetime.datetime.now().astimezone() - datetime.timedelta(days=days)
+    rows = [r for r in rows if datetime.datetime.fromisoformat(r["ts"]) >= since]
+if not rows:
+    sys.exit("STATS ERROR: 这段时间没有记分记录")
+
+def table(title, key):
+    groups = collections.defaultdict(list)
+    for r in rows:
+        groups[key(r)].append(r)
+    print(f"## {title}\n")
+    print("| 分组 | 卡数 | 通过 | 升级 | 放弃 | 一次到位 | 平均轮次 | 边界 | 品味 | 平均分钟 |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for k in sorted(groups):
+        g = groups[k]
+        n = len(g)
+        pct = lambda c: f"{c / n:.0%}"
+        avg = lambda f: f"{sum(r[f] for r in g) / n:.1f}"
+        count = lambda o: sum(r["outcome"] == o for r in g)
+        once = sum(r["outcome"] == "accepted" and r["rounds"] == 1 for r in g)
+        print(f"| {k} | {n} | {pct(count('accepted'))} | {pct(count('escalated'))} | {pct(count('abandoned'))} | "
+              f"{pct(once)} | {avg('rounds')} | {avg('scope_discipline')} | {avg('taste')} | {avg('wall_clock_min')} |")
+    print()
+
+span = f"最近 {days} 天" if days else "全部"
+print(f"# 记分卡交叉分析（{span}，{len(rows)} 张卡）\n")
+table("组 × task_type × 级别", lambda r: f"{r['group']} · {r['task_type']} · {r['complexity']}")
+table("实际模型", lambda r: r["model"] or "未查到")
+print("样本少于 5 张的分组只作参考，不据此改路由。")
+EOF

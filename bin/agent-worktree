@@ -3,6 +3,9 @@
 # 在目标仓库（主仓库或它的任意 worktree）里运行。
 # 软链接候选见 links；只链接主仓库里存在、worktree 里没有、且在 worktree 中被 git 忽略的项，
 #   这样入库的文件不会被替换，链接也不会弄脏工作区。
+# 依赖目录：主仓库里任意一层被忽略的 node_modules 也链接进去（261004 的教训：建工作目录要把每一层都接上）。
+#   执行器在 sandbox 里装不了依赖，没有它就跑不了项目自己的编译和测试；sandbox 只放开 worktree 的真实路径，
+#   链接过去的目录执行器写不了。删 worktree 只删链接本身，不动主仓库里的目录。
 # 用法：agent-worktree <task-id> [base-branch]
 #   base-branch 缺省为主仓库当前分支。
 #   worktree 目录缺省为 <主仓库同级>/<仓库名>-cards/<task-id>，可用 AGENT_CARDS_DIR 覆盖父目录。
@@ -65,16 +68,41 @@ fi
 mkdir -p "$cards_dir"
 git -C "$repo" worktree add -q -b "$branch" "$worktree" "$base" >&2
 
+link_ignored() {
+    if [ ! -e "$repo/$1" ] || [ -e "$worktree/$1" ] || [ -L "$worktree/$1" ]; then
+        return
+    fi
+    # worktree 里还没有这个路径，git 不知道它是目录，"node_modules/" 这类只匹配目录的规则要带斜杠才查得到
+    p=$1
+    [ -d "$repo/$1" ] && p=$1/
+    if ! git -C "$worktree" check-ignore -q "$p"; then
+        return
+    fi
+    mkdir -p "$(dirname "$worktree/$1")"
+    ln -s "$repo/$1" "$worktree/$1"
+    # 链接本身不算目录，只匹配目录的规则管不到它，它就成了未跟踪文件：
+    # 改成建一个真目录（规则能匹配上），再把里面的每一项分别链接过去
+    if ! git -C "$worktree" check-ignore -q "$1"; then
+        rm "$worktree/$1"
+        mkdir "$worktree/$1"
+        for e in "$repo/$1"/* "$repo/$1"/.[!.]* "$repo/$1"/..?*; do
+            if [ -e "$e" ] || [ -L "$e" ]; then
+                ln -s "$e" "$worktree/$1/$(basename "$e")"
+            fi
+        done
+    fi
+    echo "WORKTREE: 已链接 $1" >&2
+}
+
 for path in $links; do
-    if [ ! -e "$repo/$path" ] || [ -e "$worktree/$path" ] || [ -L "$worktree/$path" ]; then
-        continue
-    fi
-    if ! git -C "$worktree" check-ignore -q "$path"; then
-        continue
-    fi
-    mkdir -p "$(dirname "$worktree/$path")"
-    ln -s "$repo/$path" "$worktree/$path"
-    echo "WORKTREE: 已链接 $path" >&2
+    link_ignored "$path"
+done
+# --directory 把整个被忽略的目录收成一行，不会钻进 node_modules 里面
+git -C "$repo" ls-files --others --ignored --exclude-standard --directory | while IFS= read -r path; do
+    path=${path%/}
+    case /$path in
+        */node_modules) link_ignored "$path" ;;
+    esac
 done
 
 echo "$worktree"

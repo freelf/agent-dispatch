@@ -9,7 +9,7 @@
 #   项目规则：由 Pi 自己读（从 worktree 往上，每级目录取第一个 AGENTS.md / CLAUDE.md，放进系统提示）；
 #       临时配置目录里没有全局 AGENTS.md。跑之前按同样的规则查一遍，打印 RUN: rules，记在运行记录的 rules
 #   skills：一律不加载（--no-skills，对应 261004"Pi 执行器启动时直接关掉 Skill"）；
-#       写代码规范由 agent-dispatch 从 skill 正文渲染进 prompt
+#       写代码规范在 rules/executor.md 里，由 agent-dispatch 拼在 prompt 开头
 #   GIT_CONFIG_*：关掉提交后的 git maintenance，它要写主仓库 .git，在 sandbox 里会失败
 # 已知无害噪音：commit 结束后清理临时 ref 时要锁 packed-refs，会打印
 #   "Unable to create .../packed-refs.lock"，提交本身已成功。同理执行器不能用 git stash。

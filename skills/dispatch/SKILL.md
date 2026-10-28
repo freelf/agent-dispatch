@@ -54,7 +54,7 @@ task_type 只能用：`scaffold-bulk` / `test-docs` / `backend-logic` / `refacto
 ## 3. 副本管理（你决定，脚本执行）
 
 - 修改边界不重叠、且没有 depends 的卡才能并行；有依赖的卡等前一张合进基线后再建。
-- 建副本：`wt=$(agent-worktree <id> <base>)`。不要手动 `git worktree add`。
+- 建副本：`wt=$(agent-worktree <id> <base>)`。不要手动 `git worktree add`。被忽略的本机配置和每一层的 `node_modules` 会自动链接进去，执行器能在 sandbox 里跑项目自己的编译和测试。
 
 ## 4. 派发与修复
 
@@ -62,10 +62,12 @@ task_type 只能用：`scaffold-bulk` / `test-docs` / `backend-logic` / `refacto
 agent-dispatch "$wt" card.md                 # 第一次
 agent-dispatch "$wt" card.md fix-notes.md    # 门禁红后的修复轮，fix-notes 写你判断的问题和修法
 ```
-退出码：0 执行完且门禁绿 → 去验收；1 红 → 读输出写修复说明再派；2 用法/环境错误 → 修环境；3 需要你处理（修满 3 轮）；4 执行完但项目没声明门禁 → 按第 5 节"门禁已跳过"验收，不通过就写修复说明再派。
+退出码：0 执行完且门禁绿 → 去验收；1 红 → 读输出写修复说明再派；2 用法/环境错误 → 修环境；3 先请教 Advisor（修满 3 轮，或门禁连续两轮报出新问题）；4 执行完但项目没声明门禁 → 按第 5 节"门禁已跳过"验收，不通过就写修复说明再派。
 
-Advisor（机械信号触发，不靠感觉）：退出码 3、门禁连续两轮报出不同的新问题、定方向前没把握。
-- `agent-advise "$wt" question.md`：只读、空白上下文、`advisor` 组。question 写你卡在哪、在几个方案间犹豫什么。
+修复说明只写门禁红或验收不通过要修的问题。用户中途补的需求不走修复轮：当前卡验收合并后，另开一张新卡（`depends` 写当前卡），免得占用修复轮次、让记分的轮次失真。
+
+Advisor（机械信号触发，不靠感觉）：退出码 3（脚本自动判）、记 escalated 的卡提级重派前、定方向前没把握。
+- `agent-advise "$wt" question.md`：只读、空白上下文、`advisor` 组。question 按 `~/.claude/skills/dispatch/advise-template.md` 写三栏：机械事实、我的判断、我希望听到的答案（第三栏专门留给顾问反驳）。缺栏或没填会被拒绝。
 - 你主动请教设计问题，也可以派 Claude 子代理（Fable / Opus），只给它必要材料，不给失败历史。
 Advisor 说放弃就放弃，记分 `abandoned`。
 
@@ -87,7 +89,7 @@ agent-score <id> <accepted|escalated|abandoned> <scope 0-3> <taste 0-3> "<理由
 ```
 - scope_discipline：3 严守边界 / 2 轻微越界不用返工 / 1 明显过度设计要砍 / 0 大面积自作主张
 - taste：3 拿来即用 / 2 合格 / 1 能跑但丑 / 0 想重写
-- 升级（escalated）：质量不行要重做时，记一条 escalated，然后提高一级（S→M）用新 id 重新建卡派发，不在原卡上继续修。
+- 升级（escalated）：质量不行要重做时，记一条 escalated，先用 `agent-advise` 请教，再提高一级（S→M）用新 id 重新建卡派发，不在原卡上继续修。
 
 ## 6. 合并
 
@@ -96,6 +98,7 @@ agent-score <id> <accepted|escalated|abandoned> <scope 0-3> <taste 0-3> "<理由
 agent-merge <id> <base>     # 门禁再跑一次，绿了 merge --no-ff，清理 worktree 和卡分支
 ```
 冲突时脚本会 abort 并保留 worktree，由你解决或重新拆卡。只合进基线（feature 分支），不 push，不建 MR。
+合并提交末尾自动写追溯字段（`Agent-Card` / `Agent-Executor` / `Agent-Group` / `Agent-Models` / `Agent-Rounds` / `Agent-Sessions`），卡分支上的每个提交都能查到是谁做的。
 
 ## 7. 接入新项目
 
@@ -107,8 +110,11 @@ test  <测试命令>
 ```
 ````
 路径前缀（以 / 结尾）可限定只在改到时跑：`test project/Eve_Core/ <命令>`；没有这一项写 `test none`。命令要从项目真实配置核实。
+声明之后先喂一个已知该红的输入（比如在临时卡里让一个测试故意失败），确认门禁真的会变红，再拿它当判据（261004：一个永远不会变红的检查，等于没写）。
 
 ## 8. 复盘
 
-调度、脚本层面踩的坑，收工时追加到 `~/Documents/project/agent-dispatch/docs/lessons.md`（日期、现象、原因、改了什么）。
-记分卡在 `~/.local/state/agent-dispatch/scorecard.jsonl`，攒够一批后按「组 × task_type」看通过率和升级率，据此改 `routing.tsv` 或 magpie 组成员。
+- 调度、脚本层面踩的坑，收工时追加到 `~/Documents/project/agent-dispatch/docs/lessons.md`，带上状态。关单只问一句"这个坑现在还踩得到吗"：固化成脚本、闸门或测试，机制上不可能再发生，才写"已关闭"；只写进规则或卡的写法，算"未关闭"（261004）。
+- 卡没通过（escalated、abandoned、修满 3 轮）时，派一个子代理读这张卡的运行记录（`events.jsonl`、`gate.txt`、`last.md`），判断执行器当时为什么出错，结论写进 lessons.md。
+- 攒够一批记分后跑 `agent-stats [天数]`，按「组 × task_type × 级别」和实际模型看通过率、升级率、一次到位率，据此改 `routing.tsv` 或 magpie 组成员；样本少于 5 张的分组不据此改。
+- 升级 Pi 或 magpie 后先跑 `agent-selftest`（261004：版本钉住了，行为没钉住）。
