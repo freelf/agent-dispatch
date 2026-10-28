@@ -2,7 +2,7 @@
 # Advisor：用更强的模型、干净的上下文，对一张卡给出判断。只读，不改代码。
 # 触发靠机械信号，不靠模型自觉：agent-dispatch 退出码 3（修满 3 轮，或门禁连续两轮报出新问题）、
 #   记 escalated 的卡提级重派前、主脑定方向前。
-# 给 Advisor 的材料：任务卡、每一轮的门禁结论、相对基线的改动概况、主脑的请教卡。
+# 给 Advisor 的材料：共用规则、顾问角色、任务卡、每一轮的门禁结论、相对基线的改动概况、主脑的请教卡。
 #   不给前几轮执行器的对话，避免把失败的思路一起带进去；需要细节它自己读代码。
 # 请教卡三栏（261004）：机械事实、我的判断、我希望听到的答案；第三栏专门留给顾问反驳。
 #   模板见 skills/dispatch/advise-template.md，三栏缺一栏或没填就拒绝。
@@ -17,6 +17,7 @@ fi
 worktree=$1
 question=$2
 root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
+[ -f "$root/rules/common.md" ] || { echo "ADVISE ERROR: 缺少 rules/common.md" >&2; exit 2; }
 [ -f "$question" ] || { echo "ADVISE ERROR: 文件不存在 $question" >&2; exit 2; }
 # 每一栏下面至少要有一行不是注释的内容
 missing=$(awk '
@@ -27,7 +28,7 @@ missing=$(awk '
         for (i = 1; i <= n; i++) if (!filled[want[i]]) printf "%s ", substr(want[i], 4)
     }' "$question")
 if [ -n "$missing" ]; then
-    echo "ADVISE ERROR: 请教卡这几栏缺失或没填：${missing}（模板 ~/.claude/skills/dispatch/advise-template.md）" >&2
+    echo "ADVISE ERROR: 请教卡这几栏缺失或没填：${missing}（模板 $root/skills/dispatch/advise-template.md）" >&2
     exit 2
 fi
 
@@ -58,6 +59,8 @@ effort=${route#* }
 prompt=$(mktemp)
 trap 'rm -f "$prompt"' EXIT
 {
+    cat "$root/rules/common.md"
+    echo
     cat <<'EOF'
 # 角色
 
@@ -72,6 +75,13 @@ trap 'rm -f "$prompt"' EXIT
 - 放弃：这张卡为什么不该做或不值得做
 
 EOF
+} > "$prompt"
+rules_size=$(wc -c < "$prompt" | tr -d ' ')
+if [ "$rules_size" -gt 12288 ]; then
+    echo "ADVISE ERROR: 共用 + 顾问规则共 ${rules_size} 字节，超过上限 12288" >&2
+    exit 2
+fi
+{
     echo "# 任务卡"
     echo
     cat "$latest/card.md"
@@ -80,6 +90,7 @@ EOF
     printf '%s\n' "$rounds" | while IFS= read -r r; do
         echo
         echo "## $(basename "$r")"
+        echo "完整日志：$r/gate.txt（命令输出在 $r/gate/）。"
         echo '```'
         if [ -f "$r/gate.txt" ]; then tail -30 "$r/gate.txt"; else echo "（没有门禁输出）"; fi
         echo '```'
@@ -94,10 +105,10 @@ EOF
     echo "# 主脑的请教卡"
     echo
     cat "$question"
-} > "$prompt"
+} >> "$prompt"
 
 rc=0
-run_dir=$("$root/bin/agent-run" --read-only "$worktree" "$prompt" "$group" "$effort" advise) || rc=$?
+run_dir=$(AGENT_RULES_BYTES=$rules_size "$root/bin/agent-run" --read-only "$worktree" "$prompt" "$group" "$effort" advise) || rc=$?
 if [ $rc -eq 2 ] || [ -z "$run_dir" ]; then
     echo "ADVISE ERROR: agent-run 启动失败" >&2
     exit 2

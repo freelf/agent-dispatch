@@ -6,7 +6,16 @@ description: 主脑派活手册：把开发需求拆成任务卡，派给无头�
 # 派活手册（主脑专用）
 
 体系：主脑（你）拆卡、管副本、验收、合并、复盘 → 调度层（`agent-dispatch`：查表选组、渲染卡、派发、自动门禁；额度和降级由 magpie 路由组自己调度）→ 执行层（Pi，在 sandbox 里干活）→ 门禁（编译 + 测试）。
-命令都在 PATH 上，在目标仓库里运行。完整方案见 `~/Documents/project/agent-dispatch/docs/plan.md`。
+命令都在 PATH 上，在目标仓库里运行。完整方案见 [调度方案](../../docs/plan.md)，上下文配置见 [上下文方案](../../docs/codex-agent-dispatch-context-plan.md)。本文相对路径均相对于仓库里的 Skill 源目录。
+
+## 客户端接入与上下文
+
+- Claude Code：`install.sh --client claude`，规则进入 `~/.claude/CLAUDE.md` 受管区块，Skill 链接到 `~/.claude/skills/dispatch`。
+- Codex：`install.sh --client codex`，规则进入 `~/.codex/AGENTS.md` 受管区块，Skill 链接到 `~/.agents/skills/dispatch`。自定义配置目录和同步检查见上下文方案。
+- 两种主脑共用任务卡、脚本、路由和运行记录。子代理用当前客户端实际提供的接口：Claude 的 Agent 工具，Codex 的 `spawn_agent`／协作工具；没有该能力时由主脑在已有授权内处理，或调整拆卡方案。不要把某个客户端的模型名和参数原样传给另一个。
+- 主脑只常驻 common + brain。涉及代码设计、实现、审查、重构时按需读取 karpathy-guidelines；图片、写作任务不加载编码规范，也不派给 Pi 编码执行器。
+- Skill 和 MCP 由主脑按需调用；MCP 默认项目级，少量跨项目高频服务可保留全局配置。能满足需求时优先用 CLI。需要实时 MCP 的任务使用已确认具备该工具的原生子代理，不能假定工具会自动继承。
+- 切换主脑要交接目标、决定、卡 ID、worktree、验证结果和下一步；Claude 的自动 Memory 不作为其他客户端的共同事实来源。
 
 ## 1. 分级：派不派、怎么派
 
@@ -21,7 +30,7 @@ description: 主脑派活手册：把开发需求拆成任务卡，派给无头�
 
 怎么判断：是估，不是量。只有两条线要判对——派不派、是不是 L；S 和 M 判错代价很小（多数只差推理强度），拿不准就标 M，不要为了分 S/M 多看代码。
 1. 不模拟实现：不读函数体、不写草稿代码、不估行数。
-2. 侦察只做两件事：定位改动点、查它的引用方（`find_symbol` / `find_referencing_symbols` / `Grep`），几次搜索就停。范围大时派 Explore 子代理（`model: sonnet` 或 `haiku`），只要它回文件清单和引用方数量，不要文件内容。
+2. 侦察只做两件事：定位改动点、查它的引用方（`find_symbol` / `find_referencing_symbols` / `Grep`），几次搜索就停。范围大时用当前客户端的只读探索子代理，只要它回文件清单和引用方数量，不要文件内容。
 3. 是不是 L 只看一个问题：要不要跨模块做设计取舍、改别的模块在调用的接口或数据结构。要就是 L。
 4. 搜完还列不出修改边界，说明还没看懂，不派：再侦察一轮，或先问 Advisor。
 5. 判错由流程兜底：执行器明显超出边界、修复轮不收敛，就记 escalated 提一级重派（见第 5 节）。
@@ -34,21 +43,22 @@ task_type 只能用：`scaffold-bulk` / `test-docs` / `backend-logic` / `refacto
 
 1. **渐进替换，拆成 S/M**（改接口、改数据结构首选）：新接口与旧接口并存（一张卡）→ 调用方分批迁移（每批一张卡）→ 删旧接口（一张卡）。用 `depends` 串起来，每一步都能编译、测试通过。
 2. **你先定骨架，再派填空**（设计决定集中在少数几处）：接口、类型、测试骨架作为一张卡走「子代理路径」，合进基线后，填实现的部分拆成 S/M 卡正常派。设计取舍留在你这边，执行器只做填空。
-3. **不拆，整块走子代理路径**（高度耦合、必须一次改完）：用 Opus / Fable 子代理在 worktree 里做，门禁和合并照常。
+3. **不拆，整块走子代理路径**（高度耦合、必须一次改完）：用当前客户端适合该任务的原生子代理在 worktree 里做，门禁和合并照常。
 
 ### 子代理路径（context-coupled 卡、L 级的骨架或整块）
 
 1. `wt=$(agent-worktree <id> <base>)`，卡照常按模板写。
-2. 用 Agent 工具派 Claude 子代理（Opus / Fable）：给它卡正文和 worktree 路径，要求只在 `$wt` 里改、先写测试、小步提交、结束时工作区干净、不改 AGENTS.md、不 push。它不在 sandbox 里，权限和你一样，所以修改边界要写清楚。
+2. 用当前客户端的原生子代理接口派发：给它卡正文和 worktree 路径，要求只在 `$wt` 里改、先写测试、小步提交、结束时工作区干净、不改 AGENTS.md、不 push。它不经过 agent-run 的 Pi sandbox；使用客户端实际提供的权限和隔离方式，修改边界要写清楚。
 3. 子代理结束后跑 `agent-gate "$wt" <base>`，然后按第 5 节验收、按第 6 节 `agent-merge`。
 4. 不记分卡（记分卡用来校准路由组，这条路径不走路由）；值得记的坑写进复盘。
 
 ## 2. 写卡
 
-模板：`~/.claude/skills/dispatch/card-template.md`。卡写到仓库外（如 `$TMPDIR/cards/<id>.md`），不要放进 worktree。
-- 只填内容：目标、非目标、修改边界、完成条件。角色声明、执行规则、写代码规范（`rules/executor.md`）由调度层渲染时加上；项目根目录的 AGENTS.md 由执行器（Pi）自己读。这些都不用写进卡。
+模板：[card-template.md](card-template.md)。卡写到仓库外（如 `$TMPDIR/cards/<id>.md`），不要放进 worktree。
+- 只填内容：目标、非目标、修改边界、完成条件。共同规则（`rules/common.md`）和角色、执行规则、写代码规范（`rules/executor.md`）由调度层渲染时加上；项目根目录的 AGENTS.md 由执行器（Pi）自己读。这些都不用写进卡。
 - 完成条件写成执行器要落成的测试用例，门禁跑项目测试时自然覆盖。
-- 卡正文写得很长，说明该拆卡了。
+- 主脑用 Skill/MCP 得到的必要事实、接口版本和来源写进卡，不复制整段会话或完整 Skill。卡正文很长时检查是否该拆卡。
+- 每次派发的 common + executor 合计不得超过 12KB。项目规则和卡仍占模型上下文，另记在运行目录的 `context.json`；它统计字节，不是模型总 token。
 - 派发输出的 `RUN: rules` 是执行器读到的项目规则文件。显示"无"而项目有 AGENTS.md，多半是 AGENTS.md 既没入库也没被忽略，worktree 里没有它。
 
 ## 3. 副本管理（你决定，脚本执行）
@@ -67,8 +77,8 @@ agent-dispatch "$wt" card.md fix-notes.md    # 门禁红后的修复轮，fix-no
 修复说明只写门禁红或验收不通过要修的问题。用户中途补的需求不走修复轮：当前卡验收合并后，另开一张新卡（`depends` 写当前卡），免得占用修复轮次、让记分的轮次失真。
 
 Advisor（机械信号触发，不靠感觉）：退出码 3（脚本自动判）、记 escalated 的卡提级重派前、定方向前没把握。
-- `agent-advise "$wt" question.md`：只读、空白上下文、`advisor` 组。question 按 `~/.claude/skills/dispatch/advise-template.md` 写三栏：机械事实、我的判断、我希望听到的答案（第三栏专门留给顾问反驳）。缺栏或没填会被拒绝。
-- 你主动请教设计问题，也可以派 Claude 子代理（Fable / Opus），只给它必要材料，不给失败历史。
+- `agent-advise "$wt" question.md`：只读、独立上下文、`advisor` 组；注入 common 和顾问角色，不带编码执行器规则。question 按 [advise-template.md](advise-template.md) 写三栏：机械事实、我的判断、我希望听到的答案（第三栏专门留给顾问反驳）。缺栏或没填会被拒绝。
+- 你主动请教设计问题，也可以派当前客户端的只读子代理，只给它必要材料，不给失败历史。
 Advisor 说放弃就放弃，记分 `abandoned`。
 
 ## 5. 验收（门禁绿，或门禁已跳过之后）
@@ -93,7 +103,7 @@ agent-score <id> <accepted|escalated|abandoned> <scope 0-3> <taste 0-3> "<理由
 
 ## 6. 合并
 
-试点阶段：先把验收结论和 diff 摘要给用户，用户同意后再合。
+试点阶段：先给出验收结论和 diff 摘要；当前会话已授权合并时直接执行，否则请用户确认后再合。
 ```
 agent-merge <id> <base>     # 门禁再跑一次，绿了 merge --no-ff，清理 worktree 和卡分支
 ```
@@ -114,7 +124,7 @@ test  <测试命令>
 
 ## 8. 复盘
 
-- 调度、脚本层面踩的坑，收工时追加到 `~/Documents/project/agent-dispatch/docs/lessons.md`，带上状态。关单只问一句"这个坑现在还踩得到吗"：固化成脚本、闸门或测试，机制上不可能再发生，才写"已关闭"；只写进规则或卡的写法，算"未关闭"（261004）。
+- 调度、脚本层面踩的坑，收工时追加到 [lessons.md](../../docs/lessons.md)，带上状态。关单只问一句"这个坑现在还踩得到吗"：固化成脚本、闸门或测试，机制上不可能再发生，才写"已关闭"；只写进规则或卡的写法，算"未关闭"（261004）。
 - 卡没通过（escalated、abandoned、修满 3 轮）时，派一个子代理读这张卡的运行记录（`events.jsonl`、`gate.txt`、`last.md`），判断执行器当时为什么出错，结论写进 lessons.md。
 - 攒够一批记分后跑 `agent-stats [天数]`，按「组 × task_type × 级别」和实际模型看通过率、升级率、一次到位率，据此改 `routing.tsv` 或 magpie 组成员；样本少于 5 张的分组不据此改。
 - 升级 Pi 或 magpie 后先跑 `agent-selftest`（261004：版本钉住了，行为没钉住）。

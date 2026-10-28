@@ -9,7 +9,7 @@
 #   项目规则：由 Pi 自己读（从 worktree 往上，每级目录取第一个 AGENTS.md / CLAUDE.md，放进系统提示）；
 #       临时配置目录里没有全局 AGENTS.md。跑之前按同样的规则查一遍，打印 RUN: rules，记在运行记录的 rules
 #   skills：一律不加载（--no-skills，对应 261004"Pi 执行器启动时直接关掉 Skill"）；
-#       写代码规范在 rules/executor.md 里，由 agent-dispatch 拼在 prompt 开头
+#       写代码规范在 rules/executor.md 里，与 rules/common.md 一起由 agent-dispatch 拼在 prompt 开头
 #   GIT_CONFIG_*：关掉提交后的 git maintenance，它要写主仓库 .git，在 sandbox 里会失败
 # 已知无害噪音：commit 结束后清理临时 ref 时要锁 packed-refs，会打印
 #   "Unable to create .../packed-refs.lock"，提交本身已成功。同理执行器不能用 git stash。
@@ -93,6 +93,27 @@ while :; do
     d=$(dirname "$d")
 done
 printf '%s\n' "${rules:-无}" > "$run_dir/rules"
+
+# 字节统计不是模型 token 总量：Pi 默认提示、工具描述等不在这里计量。
+python3 -I - "$worktree" "$run_dir" "${AGENT_RULES_BYTES:-}" <<'EOF'
+import json, pathlib, sys
+wt, out, rule_bytes = sys.argv[1:]
+p = pathlib.Path(wt)
+files = []
+for directory in reversed((p, *p.parents)):
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        f = directory / name
+        if f.is_file():
+            files.append({"path": str(f), "bytes": f.stat().st_size})
+            break
+size = (pathlib.Path(out) / "prompt.md").stat().st_size
+count = int(rule_bytes) if rule_bytes else None
+(pathlib.Path(out) / "context.json").write_text(json.dumps({
+    "prompt_bytes": size, "injected_rules_bytes": count,
+    "task_material_bytes": size - count if count is not None else None,
+    "project_rules_bytes": sum(f["bytes"] for f in files), "project_rules": files,
+}, ensure_ascii=False, indent=2) + "\n")
+EOF
 
 write_profile() {
     echo '(version 1)'

@@ -20,3 +20,4 @@
 - 2026-10-27 · magpie Library 里 karpathy-guidelines 的 pi 勾掉了一次，执行器悄悄就没了写代码规范 · 当时执行器的规范来自"勾了 pi 的 skill"，勾选一变就静默失效 · 执行器不再加载 skill，写代码规范吸收进 `rules/executor.md` · 已关闭（机制：执行器规则只来自仓库里的 `rules/executor.md`，和 Library 勾选无关）。
 - 2026-10-27 · 本机抓包测试后服务进程没停 · `python3` 是 pyenv 的壳，`$!` 拿到的是壳的进程号，kill 它不会停掉真正的服务 · 服务进程自己把进程号写进文件，按文件里的号停 · 已关闭（机制：`agent-selftest`）。
 - 2026-10-28 · 执行器没拿到会话号时，`dispatch.json` 的实际模型可能张冠李戴 · 按会话号查 `magpie usage`，会话号为空时会匹配上所有会话字段为空的用量行 · 会话号为空就不查 · 已关闭（机制：`agent-dispatch` 查用量前先判会话号非空）。
+- 2026-10-28 · 执行器把运行日志和自查文档提交进仓库（eve-debug-tools/ext-sdk-v2-package-ui 首轮：`src/webview/components/__tests__/logs/` 15 个 .log + SELF_CHECK.md）· 执行规则要求"保留完整日志"，执行器就近写进了 worktree 并 `git add`；同批另一张卡写的是 `.log`，恰好被 .gitignore 忽略才没进提交 · 修复轮写明日志写到 `$TMPDIR`、自查写在最后回复 · 未关闭（只写进修复说明；机制上可让 `agent-dispatch` 在"本轮提交"统计里对新增的 *.log / 自查类文档判红）。

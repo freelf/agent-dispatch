@@ -39,7 +39,7 @@
 | 能不能合并 | 门禁 + 主脑验收 + 你点头 |
 | 失败后升级 | 主脑：记 escalated，提一级、用新卡 id 重派 |
 
-`context-coupled` 的卡（要用当前对话上下文）和 L 级里拆不开的部分不走调度层，走「子代理路径」：照常 `agent-worktree` 建副本，主脑派 Claude Code 原生子代理（Opus / Fable）在 worktree 里做，之后照常 `agent-gate` → 验收 → `agent-merge`，不记分卡。
+`context-coupled` 的卡（要用当前对话上下文）和 L 级里拆不开的部分不走调度层，走「子代理路径」：照常 `agent-worktree` 建副本，主脑派当前客户端（Claude Code / Codex）的原生子代理在 worktree 里做，之后照常 `agent-gate` → 验收 → `agent-merge`，不记分卡。
 Claude 不跑无头、不进执行器路由组（订阅条款风险）。
 
 ## 3. 组件
@@ -47,23 +47,23 @@ Claude 不跑无头、不进执行器路由组（订阅条款风险）。
 | 组件 | 位置 | 说明 |
 |---|---|---|
 | `agent-worktree <id> [base]` | bin/ | 从基线拉 `card/<id>`，worktree 在 `<仓库同级>/<仓库名>-cards/<id>`；把被忽略的 `AGENTS.md`、`CLAUDE.md`、`.codex/skills`、`.serena/*.yml` 和每一层被忽略的 `node_modules` 软链接进去（只链主仓库有、worktree 没有、且被忽略的；`node_modules/` 这类只匹配目录的规则管不到链接，改为建真目录再逐项链接） |
-| `agent-dispatch <wt> <card> [fix-notes]` | bin/ | 调度层入口。解析卡头 → 查 `routing.tsv` → 渲染 prompt（`rules/executor.md`（≤12KB）+ 卡正文 [+ 上轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读）→ `agent-run` → `agent-gate` → 从 `magpie usage` 按会话号查实际模型 → 写 `dispatch.json`（含本轮新增提交、相对基线的文件数和增删行数）。退出码 0 绿 / 1 红 / 2 错误 / 3 先请教 Advisor（修满 3 轮，或最近三轮门禁都红且每轮报的都和上一轮不同）/ 4 项目未声明门禁 |
+| `agent-dispatch <wt> <card> [fix-notes]` | bin/ | 调度层入口。解析卡头 → 查 `routing.tsv` → 渲染 prompt（`rules/common.md` + `rules/executor.md`（合计 ≤12KB）+ 卡正文 [+ 上轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读）→ `agent-run` → `agent-gate` → 从 `magpie usage` 按会话号查实际模型 → 写 `dispatch.json`（含本轮新增提交、相对基线的文件数和增删行数）。退出码 0 绿 / 1 红 / 2 错误 / 3 先请教 Advisor（修满 3 轮，或最近三轮门禁都红且每轮报的都和上一轮不同）/ 4 项目未声明门禁 |
 | `agent-run [--read-only] <wt> <prompt> <group> <effort> <label>` | bin/ | 在 sandbox 里跑 Pi，见第 5 节。检查 Pi 最后回复的 `stopReason`，`error/aborted` 判失败（Pi 出错也可能以 0 退出） |
 | `agent-gate <wt> <base>` | bin/ | 门禁，见第 6 节 |
-| `agent-advise <wt> <question>` | bin/ | Advisor：`advisor` 组、只读 sandbox、空白上下文；材料 = 卡 + 各轮门禁结论 + 改动概况 + 主脑的请教卡，不给执行器对话历史；请教卡三栏（机械事实 / 我的判断 / 我希望听到的答案），缺栏或没填拒绝 |
+| `agent-advise <wt> <question>` | bin/ | Advisor：`advisor` 组、只读 sandbox、空白上下文；材料 = common + 顾问角色 + 卡 + 各轮门禁结论 + 改动概况 + 主脑的请教卡，不给执行器对话历史；请教卡三栏（机械事实 / 我的判断 / 我希望听到的答案），缺栏或没填拒绝 |
 | `agent-score <id> <outcome> <scope> <taste> <note>` | bin/ | 记分卡，字段沿用 06；组、模型、轮次、耗时从运行记录自动填；note 必填 |
 | `agent-merge <id> <base>` | bin/ | 门禁再跑一次，绿了在基线所在工作区 `merge --no-ff`；冲突 abort 并保留 worktree；成功后删 worktree 和卡分支。合并提交末尾写追溯字段 `Agent-Card/Executor/Group/Models/Rounds/Sessions`（取自运行记录） |
 | `agent-stats [天数]` | bin/ | 记分卡交叉分析（附录 06）：按「组 × task_type × 级别」和实际模型出通过率、升级率、一次到位率、平均轮次、两项分数 |
-| `agent-selftest [--real]` | bin/ | 自检，见第 8 节。缺省把执行器请求发到本机抓包服务，不花模型钱；`--real` 再用真模型派一张小卡 |
+| `agent-selftest [--real] [--check-install]` | bin/ | 自检，见第 8 节。缺省把执行器请求发到本机抓包服务，不花模型钱；`--real` 再用真模型派一张小卡；`--check-install` 额外核对当前 Claude 主脑安装 |
 | `routing.tsv` | 根目录 | (task_type, 级别) → 组 + 推理强度 |
-| `rules/executor.md` | rules/ | 执行器规则：角色声明 + 执行规则 + 写代码规范（吸收自 karpathy-guidelines），≤12KB |
-| `skills/dispatch/SKILL.md` | → `~/.claude/skills/dispatch` | 主脑侧规则：分级、写卡、副本管理、修复、Advisor、验收打分、合并、接入新项目、复盘 |
+| `rules/common.md` / `rules/brain.md` / `rules/executor.md` | rules/ | 通用规则 / 主脑角色 / 编码执行器规则；主脑生成文件 ≤24KB，common + executor ≤12KB |
+| `skills/dispatch/SKILL.md` | → Claude / Codex 的 Skill 目录 | 主脑侧规则：分级、写卡、副本管理、修复、Advisor、验收打分、合并、接入新项目、复盘 |
 | `skills/dispatch/card-template.md` | 同上 | 卡模板：卡头 id/type/level/base/depends + 目标/非目标/修改边界/完成条件 |
 | `skills/dispatch/advise-template.md` | 同上 | 请教卡模板，三栏 |
-| `install.sh` | 根目录 | bin/ → `~/.local/bin`，skills/ → `~/.claude/skills`，可重复执行 |
+| `install.sh` | 根目录 | `--client claude/codex/all` 安装命令、Skill 及 common + brain 受管区块；`--check` 查同步状态，保留其他指令、改前备份 |
 
 运行记录：`~/.local/state/agent-dispatch/runs/<仓库名>/<卡id>/<时间戳>-<exec|fix-N|advise>/`
-（prompt.md、card.md、fix-notes.md、rules、events.jsonl、stderr.log、last.md、session、sandbox.sb、gate.txt、gate/、dispatch.json；advise 轮另有 question.md）。
+（prompt.md、card.md、fix-notes.md、rules、context.json、events.jsonl、stderr.log、last.md、session、sandbox.sb、gate.txt、gate/、dispatch.json；advise 轮另有 question.md）。
 记分卡：`~/.local/state/agent-dispatch/scorecard.jsonl`。
 
 ## 4. 选模型
@@ -90,7 +90,7 @@ Claude 不跑无头、不进执行器路由组（订阅条款风险）。
 
 - Pi 0.73.0（`npm i -g @mariozechner/pi-coding-agent`），`magpie pi` 已写好 `~/.pi/agent/models.json`。
 - 每次运行给 Pi 一份临时配置目录（只含 models.json + 关遥测的 settings），`PI_OFFLINE=1`；`--no-session --no-skills --no-extensions`，工具 `read,bash,edit,write`（Advisor 为 `read,grep,find,ls,bash`）。
-- skill（2026-10-27 定稿）：执行器一律不加载 skill（`--no-skills`）。执行器规则是 `rules/executor.md` 一个文件（角色声明 + 执行规则 + 写代码规范，写代码规范吸收自 karpathy-guidelines），`agent-dispatch` 原样拼在卡前面；超过 12KB 就拒绝派发。
+- 上下文（2026-10-28）：`agent-dispatch` 将 `rules/common.md` + `rules/executor.md` 拼在卡前面，合计超过 12KB 拒绝派发。执行器仍不加载 Skill；编码规范（Karpathy）常驻 executor，主脑按任务加载。Advisor 注入 common + 自己的顾问角色，同样检查 12KB，不带 executor。
 - MCP：执行器暂时用不了，有两处障碍。① 装的 `@mariozechner/pi-coding-agent` 0.73 没有 MCP，这个包名已停在 0.73.1，Pi 改到 `@earendil-works/pi-coding-agent`（1.4.0），据 pi-mcp-adapter 的 README，Pi 0.99 起自带 MCP；② sandbox 禁外网，context7、exa、deepwiki 都要联网，需要在 sandbox 外起一个本机 MCP 中转，执行器经 localhost 访问。现在由主脑用 MCP 查好、写进卡里。
 - 项目规则（2026-10-27 改）：由 Pi 自己读。Pi 从 worktree 往上，每级目录只取第一个 AGENTS.md / CLAUDE.md 放进系统提示（0.73 `dist/core/resource-loader.js`），所以同一目录不会重复注入；临时配置目录里没有全局 AGENTS.md，worktree 的上级目录目前也没有。项目统一用根目录 AGENTS.md，必须入库或被 .gitignore 忽略（被忽略的由 `agent-worktree` 软链进去），否则 worktree 里没有，执行器读不到。`agent-run` 按同样的规则查一遍，打印 `RUN: rules <文件>`。这条依赖 Pi 的行为，升级 Pi 后要重新验证。
 - 首轮输入约 4.5k token，不含项目 AGENTS.md（Codex 为 14k–21k）。
@@ -124,7 +124,7 @@ AI 审查、规则式审查（OCR）、改动量、格式检查不在门禁里�
 
 ## 7. 已定决策
 
-1. 主脑 = Claude Code 交互会话；执行器 = Pi 无头（2026-10-26 由 Codex 改为 Pi）；Advisor 机械触发走 `agent-advise`，主脑主动请教可派 Claude 子代理。
+1. 当前主脑 = Claude Code 交互会话；保留 Codex 接入能力，尚不启用；执行器 = Pi 无头；Advisor 机械触发走 `agent-advise`，主脑主动请教可用当前客户端的原生子代理。
 2. 分级标准写死在 SKILL.md：不派 / S / M / L。L 按"有没有跨模块设计取舍"判，不按行数；L 不进执行器，按顺序走：渐进替换拆成 S/M → 主脑先定骨架（走子代理路径）再派填空 → 整块走子代理路径（2026-10-27 定）。
 3. 分支：`master` ← 你建 MR；基线（如 `zdp/feature/v2.0.0`）← 卡分支本地 `merge --no-ff`，不推远端。
 4. 调度体系全局化，项目里只放项目自己的东西（AGENTS.md 里的门禁声明）。
@@ -135,11 +135,11 @@ AI 审查、规则式审查（OCR）、改动量、格式检查不在门禁里�
 9. 公司代码可以交给外部模型；ChatGPT 订阅可以给 Pi 用（2026-10-27 确认）。
 10. 公司仓库暂不声明门禁：执行器改完直接交主脑验收；主脑在验收结论里写明哪些编译测试没验证。
 11. 主脑规则分两层（对应 261004 的"主脑专属常驻 + Skill 按需加载"）：常驻的角色声明写在全局 `~/.claude/CLAUDE.md`（两行：只调研规划拆卡验收、改代码的需求走 dispatch skill），流程细节都在 `skills/dispatch/SKILL.md`（2026-10-27 定）。
-12. 执行器不加载任何 skill，规则在派活时现场渲染，照 261004:135："执行器这一侧，是派活那一刻现场渲染的：只拿共用底座里执行器用得上的部分，加上它那家工具的段落，再拼上任务卡和角色声明。Pi 执行器启动时直接关掉 Skill"。执行器规则只有一个文件 `rules/executor.md`（角色声明 + 执行规则 + 写代码规范），上限 12KB（261004:139），"加一条规则之前，就必须先想清楚要删哪条"。skill 照 261004 处理：别人的 skill "最优解是吸收内化到自己的工作流里"（185），karpathy-guidelines 已原文吸收进 `rules/executor.md`；Library 里的 skill 只给主脑和交互式工具按需加载，执行器不加载（2026-10-27 定稿，取代当天先后做过的"--skill 让执行器自己读"和"把 Library 的 skill 正文拼进 prompt"）。
-13. 项目规则由 Pi 自己读，调度层只拼自己的角色声明、执行规则和卡（对应附录 05："Agent 进入项目前先读这个文件"）。原因：拼进 prompt 会把项目 AGENTS.md 算进 12KB 上限，eve 的 AGENTS.md 有 6KB，修复轮就会超；Pi 每级目录只取一个规则文件，不会重复注入。12KB 上限只管我们渲染的规则部分（第 12 条），不含项目 AGENTS.md 和卡。项目统一用 AGENTS.md（2026-10-27 定）。
-14. 执行器要遵守的写代码习惯只改 `rules/executor.md` 这一处；Library 里的 skill 和 Instructions 都进不了执行器（`--no-skills`，临时配置目录也不带 `~/.pi/agent/AGENTS.md`）（2026-10-27 定）。
+12. 共同规则由仓库 `rules/common.md` 维护，不用 Magpie 共享指令。主脑 = common + brain，由 `install.sh` 同步到对应客户端受管区块，保留其他指令，生成后的全局文件上限 24KB。执行器 = common + executor + 卡，不加载 Skill；common + executor 合计上限 12KB。Karpathy 不进 common：主脑按代码任务加载，执行器从 executor 获得完整规范。
+13. 项目规则由 Pi 自己读取一次，不重复拼入用户消息。12KB 只限制自有规则；项目规则、任务卡和修复材料同样消耗模型上下文，由 `context.json` 分项记录字节数，不表示模型完整 token 用量。项目统一维护 AGENTS.md；Claude 的实际加载受版本、祖先目录指令和配置影响，接入时检查 `/memory` 或 `/context`。
+14. 跨任务、跨角色规则只改 common；编码执行器规则只改 executor；主脑职责只改 brain。Magpie 继续管路由和可选工具分发；MCP 默认项目级，高频全局服务按需保留。改主脑底稿后重新安装并执行 `install.sh --client claude --check`；执行器和 Advisor 下一次运行直接读新源文件。
 15. 2026-10-28 对照两篇文章补齐的机制：建 worktree 接上每一层 node_modules（261004「建工作目录…自动把每一层配置都接上」）；Advisor 请教卡三栏、「门禁连续两轮报出新问题」由脚本判（261004）；合并提交写追溯字段、`dispatch.json` 记提交和改动量（260809「每次提交都能追溯」）；`agent-stats` 交叉分析和一次到位率（附录 06、260809）；教训单按「这个坑现在还踩得到吗」关单（261004）；`agent-selftest` 每个检查都配已知该红的输入（261004「先喂一个已知答案为'否'的输入」「版本钉住了但行为没钉住」）；Claude Code 会话记录永久保留（261004 保留轨迹，`cleanupPeriodDays` 36500）。
-    没做的和原因：门禁里的 AI 审查 / OCR / 格式检查（第 5 条，门禁只管编译和测试）；额度水位和降级链（magpie 负责）；定时分诊、架构扫描、周复盘（要常驻调度器，现在作为 SKILL 第 8 节的手动步骤）；跨 Agent 共享记忆（只有一个主脑）；前端录屏验收（目前没有前端卡）；`.env`、`local.properties` 不链进 worktree（可能有密钥，会随请求发给模型商）。
+    没做的和原因：门禁里的 AI 审查 / OCR / 格式检查（第 5 条，门禁只管编译和测试）；额度水位和降级链（magpie 负责）；定时分诊、架构扫描、周复盘（要常驻调度器，现在作为 SKILL 第 8 节的手动步骤）；独立共享 Memory 服务（暂用仓库事实和显式任务交接，客户端记忆不自动共享）；前端录屏验收（目前没有前端卡）；`.env`、`local.properties` 不链进 worktree（可能有密钥，会随请求发给模型商）。
 
 ## 8. 自测结果（2026-10-26，临时仓库，未用公司代码）
 
@@ -182,3 +182,5 @@ AI 审查、规则式审查（OCR）、改动量、格式检查不在门禁里�
 15. 你自己的仓库（如博客）把 AGENTS.md 里的验证命令改写成 `agent-gate` 代码块。
 16. 仓库提交作者是公司邮箱（`zhangdongpo@kuaishou.com`），个人仓库是否改成个人邮箱；是否推到私有远端。
 17. ~~Claude Code 会话记录永久保留~~ `~/.claude/settings.json` 设 `cleanupPeriodDays: 36500`（2026-10-28，改前备份在 `~/.claude/settings.json.bak-agent-dispatch-20261027`）。
+
+2026-10-28 上下文改造验证：离线集成自检 64 项通过；安装器另有 10 项回归测试，覆盖双客户端、受管区块保留与幂等、底稿过期检测、UTF-8 合计预算、损坏标记、覆盖文件及安装目标冲突。Pi 抓包验证 common + executor 和 Advisor common 注入各一次；项目规则单独加载和计量。实际安装后可运行 `agent-selftest --check-install` 额外检查当前 Claude 主脑同步状态。

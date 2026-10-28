@@ -1,9 +1,9 @@
 #!/bin/sh
 # 调度层入口：把一张任务卡派给执行器，跑完自动过门禁，把结果交回主脑。
 # 步骤：解析卡头 → 查映射表得到组和推理强度 → 渲染最终 prompt
-#       （执行器规则 rules/executor.md + 卡正文 [+ 上一轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读，见 agent-run）
+#       （共用规则 rules/common.md + 执行器规则 rules/executor.md + 卡正文 [+ 上一轮门禁输出 + 修复说明]；项目 AGENTS.md 由 Pi 自己读，见 agent-run）
 #   rules/executor.md = 角色声明 + 执行规则 + 写代码规范，对应 261004 执行器侧"共用底座里执行器用得上的部分 + 工具段落 + 角色声明"；
-#   不超过 12KB（261004 执行器侧的注入上限），卡和修复说明不算。执行器本身不加载 skill。
+#   common + executor 合计不超过 12KB（261004 执行器侧的注入上限），卡和修复说明不算。执行器本身不加载 skill。
 #       → agent-run → agent-gate → 从 magpie usage 查实际接请求的模型 → 写 dispatch.json。
 # worktree 由主脑事先用 agent-worktree 建好（并行、排队、基线由主脑决定），调度层不建也不合并。
 # 用法：agent-dispatch <worktree> <card.md> [fix-notes.md]
@@ -26,8 +26,9 @@ rules_limit=12288
 root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
 bin=$root/bin
 rules=$root/rules/executor.md
+common=$root/rules/common.md
 
-for f in "$card" ${notes:+"$notes"}; do
+for f in "$common" "$rules" "$card" ${notes:+"$notes"}; do
     [ -f "$f" ] || { echo "DISPATCH ERROR: 文件不存在 $f" >&2; exit 2; }
 done
 
@@ -60,7 +61,7 @@ case $level in
     *) echo "DISPATCH ERROR: level 只能是 S 或 M: $level" >&2; exit 2 ;;
 esac
 if [ "$type" = context-coupled ]; then
-    echo "DISPATCH ERROR: context-coupled 的卡不走调度层，由主脑直接派 Claude 子代理" >&2
+    echo "DISPATCH ERROR: context-coupled 的卡不走调度层，由主脑使用当前客户端的原生子代理" >&2
     exit 2
 fi
 
@@ -106,12 +107,12 @@ fi
 
 prompt=$(mktemp)
 trap 'rm -f "$prompt"' EXIT
-rules_size=$(wc -c < "$rules" | tr -d ' ')
+{ cat "$common"; printf '\n'; cat "$rules"; } > "$prompt"
+rules_size=$(wc -c < "$prompt" | tr -d ' ')
 if [ "$rules_size" -gt "$rules_limit" ]; then
-    echo "DISPATCH ERROR: 执行器规则 $rules 共 ${rules_size} 字节，超过上限 ${rules_limit}：加一条规则之前，先想清楚要删哪条" >&2
+    echo "DISPATCH ERROR: 共用 + 执行器规则共 ${rules_size} 字节，超过上限 ${rules_limit}：加一条规则之前，先想清楚要删哪条" >&2
     exit 2
 fi
-cp "$rules" "$prompt"
 {
     echo
     echo "# 任务卡"
@@ -121,7 +122,7 @@ cp "$rules" "$prompt"
         echo
         echo "# 修复（第 ${fix} 轮）"
         echo
-        echo "上一轮的提交已在当前分支上。门禁输出："
+        echo "上一轮的提交已在当前分支上。门禁摘要如下；完整日志：$prev/gate.txt（命令输出在 $prev/gate/）。"
         echo
         echo '```'
         if [ -f "$prev/gate.txt" ]; then tail -80 "$prev/gate.txt"; else echo "（上一轮没有门禁输出）"; fi
@@ -135,7 +136,7 @@ cp "$rules" "$prompt"
 
 head_before=$(git -C "$worktree" rev-parse HEAD)
 rc=0
-run_dir=$("$bin/agent-run" "$worktree" "$prompt" "$group" "$effort" "$label") || rc=$?
+run_dir=$(AGENT_RULES_BYTES=$rules_size "$bin/agent-run" "$worktree" "$prompt" "$group" "$effort" "$label") || rc=$?
 if [ $rc -eq 2 ] || [ -z "$run_dir" ]; then
     echo "DISPATCH ERROR: agent-run 启动失败" >&2
     exit 2

@@ -3,21 +3,25 @@
 # 为什么要有（261004）：版本钉住了，行为没钉住——升级 Pi / magpie、改了脚本之后先跑它；
 #   任何判据写完之后，先喂一个已知答案为"否"的输入，确认它会变红。所以这里每个检查都配了该红的输入。
 # 缺省不花模型钱：执行器的请求发到本机一个抓包服务（一律回 400），只检查 Pi 实际发出去的上下文：
-#   项目 AGENTS.md 在系统提示里恰好一次、同目录的 CLAUDE.md 不读、没有 skill 清单、用户消息以 rules/executor.md 开头。
+#   项目 AGENTS.md 在系统提示里恰好一次、同目录的 CLAUDE.md 不读、没有 skill 清单、用户消息以 common + executor 开头。
 #   另跑一次不带 --no-skills 的对照组，确认 skill 清单这条检查判得了红。
 # --real：再用真实模型派一张小卡，要求门禁绿、提交信息遵守测试仓库 AGENTS.md 的约定、合并提交带实际模型。
 # 测试仓库建在状态目录下（不放 /tmp，sandbox 本来就放开临时目录，越权测试会假通过），
 #   运行记录写到测试目录自己的 state，不碰真实记分卡。全部通过就删掉测试目录，有失败就保留供排查。
-# 用法：agent-selftest [--real]
+# --check-install：额外检查当前 Claude 主脑的实际安装是否与底稿同步。
+# 用法：agent-selftest [--real] [--check-install]
 # 退出码：0 全部通过；1 有检查失败；2 用法或环境错误。
 set -eu
 
 real=0
-case ${1:-} in
-    '') ;;
-    --real) real=1 ;;
-    *) echo "用法: $0 [--real]" >&2; exit 2 ;;
-esac
+check_install=0
+for arg in "$@"; do
+    case $arg in
+        --real) real=1 ;;
+        --check-install) check_install=1 ;;
+        *) echo "用法: $0 [--real] [--check-install]" >&2; exit 2 ;;
+    esac
+done
 root=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)
 bin=$root/bin
 real_pi_home=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
@@ -186,6 +190,12 @@ else
     ok "bin/ 和 install.sh 里没有这种写法"
 fi
 
+section "安装：受管区块、双客户端、过期检测和预算反例"
+assert_rc "隔离配置目录中的安装回归测试" 0 "OK" python3 -I "$root/scripts/test_install.py"
+if [ "$check_install" -eq 1 ]; then
+    assert_rc "实际主脑安装已同步（Claude）" 0 "CHECK:" "$root/install.sh" --client claude --check
+fi
+
 # ---------- 1. worktree ----------
 section "worktree：链接依赖目录，不弄脏工作区"
 wt=$("$bin/agent-worktree" g1 main 2> "$t/worktree.log")
@@ -222,12 +232,13 @@ assert_rc "基线没声明门禁 → 跳过（返回 3，不算绿）" 3 "GATE S
 
 # ---------- 3. 执行器规则上限 ----------
 section "执行器规则：不超过 12KB"
-check "rules/executor.md 不超过 12288 字节" test "$(wc -c < "$root/rules/executor.md")" -le 12288
+check "common + executor 不超过 12288 字节" test "$(( $(wc -c < "$root/rules/common.md") + 1 + $(wc -c < "$root/rules/executor.md") ))" -le 12288
 mkdir -p "$t/fakeroot/rules"
 cp -R "$bin" "$root/routing.tsv" "$t/fakeroot/"
-head -c 13000 /dev/zero | tr '\0' x > "$t/fakeroot/rules/executor.md"
+head -c 7000 /dev/zero | tr '\0' x > "$t/fakeroot/rules/common.md"
+head -c 6000 /dev/zero | tr '\0' x > "$t/fakeroot/rules/executor.md"
 mkcard g1 "超限检查"
-assert_rc "规则文件超过 12KB → 拒绝派发" 2 "超过上限" "$t/fakeroot/bin/agent-dispatch" "$wt" "$t/g1.md"
+assert_rc "两个文件各自未超限、合计超过 12KB → 拒绝派发" 2 "超过上限" "$t/fakeroot/bin/agent-dispatch" "$wt" "$t/g1.md"
 
 # ---------- 4. 派发：抓包看执行器实际收到的上下文 ----------
 section "派发：执行器实际收到的上下文（抓包，不花模型钱）"
@@ -238,27 +249,35 @@ mkcard c1 "抓包检查，不要真的执行。"
 : > "$cap"
 assert_rc "执行器报错 → 派发返回 1，打印读到的项目规则" 1 "RUN: rules $wt/AGENTS.md" "$bin/agent-dispatch" "$wt" "$t/c1.md"
 c1_run=$(ls -d "$runs"/c1/*-exec | tail -1)
-python3 -I - "$cap" "$root/rules/executor.md" "$c1_run" "$wt/AGENTS.md" > "$t/tally" <<'EOF'
+python3 -I - "$cap" "$root/rules/executor.md" "$c1_run" "$wt/AGENTS.md" "$root/rules/common.md" > "$t/tally" <<'EOF'
 import json, sys
-cap, rules_path, run, agents = sys.argv[1:]
+cap, rules_path, run, agents, common_path = sys.argv[1:]
 def say(c, d): print(("PASS|" if c else "FAIL|") + d)
 reqs = [json.loads(l) for l in open(cap) if l.strip()]
 if not reqs:
     say(False, "抓包：没收到执行器的请求")
     sys.exit()
 raw = reqs[0]["body"]
-msgs = json.loads(raw).get("messages", [])
+request = json.loads(raw)
+msgs = request.get("messages", request.get("input", []))
 text = lambda c: c if isinstance(c, str) else "".join(p.get("text", "") for p in c or [])
 system = "".join(text(m.get("content")) for m in msgs if m.get("role") in ("system", "developer"))
 user = "".join(text(m.get("content")) for m in msgs if m.get("role") == "user")
-rules = open(rules_path).read().strip()
+common = open(common_path).read()
+rules = common + "\n" + open(rules_path).read()
 say(system.count("MARKER-AGENTS-7f3a") == 1, "系统提示里项目 AGENTS.md 恰好出现一次")
 say("MARKER-CLAUDE-7f3a" not in raw, "同目录有 AGENTS.md 时不读 CLAUDE.md")
 say("<available_skills>" not in system and "MARKER-SKILL-7f3a" not in raw, "没有 skill 清单（--no-skills 生效）")
-say(user.startswith(rules), "用户消息以 rules/executor.md 开头")
+say(user.startswith(rules), "用户消息以 common + executor 开头")
+say(user.count(common.strip()) == 1, "共同规则恰好一次")
+say("## 1. Think Before Coding" in user and "# 主脑\n" not in user, "包含编码规范、不含主脑规则")
 say(rules[:200] not in system, "执行器规则没有重复进系统提示")
 say(user.count("MARKER-CARD-7f3a") == 1, "任务卡正文在用户消息里出现一次")
 say(open(run + "/rules").read().strip() == agents, "运行记录 rules 指向 worktree 的 AGENTS.md")
+context = json.load(open(run + "/context.json"))
+say(context["injected_rules_bytes"] == len(rules.encode()), "字节统计包含 common 和 executor")
+say(context["project_rules"] == [{"path": agents, "bytes": len(open(agents, "rb").read())}], "项目规则单独统计")
+say(context["prompt_bytes"] == context["injected_rules_bytes"] + context["task_material_bytes"], "任务材料与规则分别计量")
 m = json.load(open(run + "/dispatch.json"))
 say(m["head_before"] == m["head_after"] and m["commits"] == [], "dispatch.json：执行器没提交，本轮提交为空")
 say(m["diff_vs_base"] == {"files": 1, "insertions": 1, "deletions": 0}, "dispatch.json：相对基线的累计改动量")
@@ -311,6 +330,23 @@ MARKER-ASK-7f3a 继续修。' "$t/ask-part.md" > "$t/ask-full.md"
 : > "$cap"
 assert_rc "三栏填满 → 交给 Advisor（抓包回 400，返回 1）" 1 "ADVISE: 记录" "$bin/agent-advise" "$wt" "$t/ask-full.md"
 check "Advisor 收到了请教卡" grep -q "MARKER-ASK-7f3a" "$cap"
+python3 -I - "$cap" "$root/rules/common.md" > "$t/tally" <<'EOF'
+import json, sys
+raw = json.loads(open(sys.argv[1]).readline())["body"]
+request = json.loads(raw)
+messages = request.get("messages", request.get("input", []))
+def text(c): return c if isinstance(c, str) else "".join(p.get("text", "") for p in c or [])
+user = "".join(text(m.get("content")) for m in messages if m.get("role") == "user")
+common = open(sys.argv[2]).read()
+def say(c, d): print(("PASS|" if c else "FAIL|") + d)
+say(user.startswith(common + "\n# 角色") and user.count(common.strip()) == 1, "Advisor 共同规则恰好一次，随后为顾问角色")
+say("## 1. Think Before Coding" not in user and "# 主脑\n" not in user, "Advisor 不混入执行器编码规范或主脑规则")
+say("完整日志：" in user, "Advisor 摘要附完整证据路径")
+EOF
+tally "$t/tally"
+head -c 13000 /dev/zero | tr '\0' x > "$t/fakeroot/rules/common.md"
+assert_rc "Advisor 规则超限 → 拒绝" 2 "超过上限" "$t/fakeroot/bin/agent-advise" "$wt" "$t/ask-full.md"
+
 advise_run=$(ls -d "$runs"/c1/*-advise | tail -1)
 refuse "Advisor 的只读 sandbox 里 worktree 不可写" sbw "$advise_run/sandbox.sb" "$wt/.sb-escape"
 rm -f "$wt/.sb-escape"
